@@ -128,6 +128,18 @@ docs/                  imagens do README
 
 > ⚠️ `fixtures/app-vulneravel/` é **deliberadamente inseguro**. Existe só para validar a skill. Nunca use como base de nada.
 
+## Atualizações
+
+A skill é instalada por clone, então ela **não avisa sozinha** quando sai versão nova. Para atualizar:
+
+```bash
+cd ~/.claude/skills/ll-sec && git pull
+```
+
+> 💡 **Para ser avisado das novidades:** clique em **Watch** (canto superior direito desta página) → **Custom** → marque **Releases**. O GitHub te notifica a cada versão publicada, sem encher a caixa com cada commit.
+
+Cada versão fica em [Releases](../../releases), com o que mudou.
+
 ## Licença
 
 [MIT](LICENSE) — use, copie, adapte, redistribua.
