@@ -1,0 +1,6 @@
+{
+  "name": "app-vulneravel",
+  "private": true,
+  "description": "Fixture intencionalmente insegura do ll-sec. NAO USAR.",
+  "dependencies": { "express": "^4.18.0", "cors": "^2.8.5", "jsonwebtoken": "^8.5.1" }
+}
