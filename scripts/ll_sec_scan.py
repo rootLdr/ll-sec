@@ -134,7 +134,10 @@ def listar_arquivos(root: Path, mode: str, since: str | None) -> tuple[list[Path
 
     encontrados: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in IGNORAR_DIRS and not d.startswith(".git")]
+        # `d != ".git"`, e não `startswith(".git")`: o prefixo comia `.github/` e
+        # `.gitlab/` junto com o `.git/`, e workflow de CI é dos lugares mais
+        # comuns para segredo em texto claro. Só o diretório do Git sai.
+        dirnames[:] = [d for d in dirnames if d not in IGNORAR_DIRS and d != ".git"]
         for fn in filenames:
             p = Path(dirpath) / fn
             if relevante(p):
