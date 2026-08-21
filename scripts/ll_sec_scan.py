@@ -1613,7 +1613,8 @@ pre{background:#0d1117;border:1px solid #30363d;border-radius:7px;padding:11px 1
 .q-nenhuma{background:#21262d;border:1px solid #30363d;color:#8b949e}
 .legenda{margin-bottom:20px}
 .legenda summary{font-size:14px}
-.tab-leg{margin-top:12px}
+.rolagem{overflow-x:auto;max-width:100%;-webkit-overflow-scrolling:touch}
+.tab-leg{margin-top:12px;min-width:520px}
 .tab-leg td{vertical-align:top;font-size:12.5px}
 .leg-c{font-family:ui-monospace,Menlo,monospace;color:#79c0ff;font-weight:600;width:44px}
 .leg-n{color:#f0f6fc;font-weight:600;white-space:nowrap}
@@ -1665,6 +1666,13 @@ summary{cursor:pointer;font-weight:600;color:#f0f6fc}
 table{width:100%;border-collapse:collapse;font-size:13px}
 td,th{padding:7px 10px;border-bottom:1px solid #21262d;text-align:left}
 th{color:#8b949e;font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.5px}
+@media (max-width:760px){
+.wrap{padding:20px 12px 60px}
+.leg-n{white-space:normal}
+.tab-leg{min-width:720px}
+.tab-leg td{font-size:12px}
+.leg-m{width:auto}
+}
 @media print{body{background:#fff;color:#000}.tab{display:none}.painel{display:block!important}
 .item,.card,.meta,details{background:#fff;border-color:#ccc;break-inside:avoid}
 .tit,h1{color:#000}pre{background:#f6f8fa;color:#000}
@@ -1893,10 +1901,10 @@ def render_legenda(ctx: dict) -> str:
             f'<td class="leg-m">{selo_cobertura(info.get("cobertura", "nenhuma"))}</td></tr>')
     return f"""<details class="legenda" open>
 <summary>O que significa cada categoria (C1 a C9)</summary>
-<table class="tab-leg"><thead><tr>
+<div class="rolagem"><table class="tab-leg"><thead><tr>
 <th>Sigla</th><th>Categoria</th><th>O que é, em uma frase</th>
 <th>O que achei</th><th>O quanto olhei</th>
-</tr></thead><tbody>{''.join(linhas)}</tbody></table>
+</tr></thead><tbody>{''.join(linhas)}</tbody></table></div>
 <p class="leg-rod">São <b>duas perguntas diferentes</b>, e as duas são respondidas sempre.
 <b>"Limpo"</b> só aparece quando nada foi encontrado <b>e</b> a cobertura foi completa.
 <b>Não verificado</b> não é boa notícia: é ausência de resposta. A aba <b>Cobertura</b> diz,
@@ -1969,7 +1977,7 @@ def render_checks(ctx: dict) -> str:
 <div class="cab-check"><b>{c} · {esc(nome)}</b>
 {selo_resultado(cat_info)} {selo_cobertura(cat_info.get("cobertura", "nenhuma"))}
 <span class="ver-cap">catálogo v{cat_info.get("capability_version", 1)}</span></div>
-<table class="tab-leg"><tbody>{linhas}</tbody></table>
+<div class="rolagem"><table class="tab-leg"><tbody>{linhas}</tbody></table></div>
 <details class="gaps"><summary>Lacunas declaradas desta categoria ({len(cat_info.get("known_gaps", []))})</summary>
 <ul>{gaps}</ul></details></div>""")
     return "".join(blocos)
@@ -2035,9 +2043,9 @@ def render_html(ctx: dict) -> str:
         for sev, d in sorted(NOTAS.items(), key=lambda kv: -kv[1]["nota"]))
     legenda_notas = f"""<details class="legenda" open>
 <summary>O que significa a nota de risco (1 a 5)</summary>
-<table class="tab-leg"><thead><tr>
+<div class="rolagem"><table class="tab-leg"><thead><tr>
 <th>Nota</th><th>Nível</th><th>O que quer dizer</th><th>Nesta execução</th>
-</tr></thead><tbody>{linhas_nota}</tbody></table>
+</tr></thead><tbody>{linhas_nota}</tbody></table></div>
 <p class="leg-rod">A nota é dada por <b>quem consegue explorar</b> a falha, não por quanto ela
 parece grave. Na dúvida entre duas notas, vale a menor — e o achado diz o que falta para
 confirmar. Os itens da aba "Verificado e OK" não entram nesta contagem.</p>
