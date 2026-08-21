@@ -243,7 +243,7 @@ def listar_arquivos(root: Path, mode: str, since: str | None) -> tuple[list[Path
 
     for balde, rotulo in (("nao_reconhecido", "de tipo não reconhecido"),
                           ("acima_do_limite", "acima do limite de tamanho"),
-                          ("ilegivel", "ilegíveis"),
+                          ("ilegivel", "sem permissão de leitura"),
                           ("fora_da_raiz", "apontando para fora da raiz")):
         for p_ in inv[balde]:
             cobertura["nao_lidos"].append(dict(arquivo=rel_de(p_, root),
@@ -297,7 +297,7 @@ def listar_arquivos(root: Path, mode: str, since: str | None) -> tuple[list[Path
         for p_ in cortados:
             cobertura["nao_lidos"].append(dict(arquivo=rel_de(p_, root),
                                                ext=chave_ext(p_),
-                                               motivo="cortados pelo orçamento do modo"))
+                                               motivo="fora do orçamento do modo"))
         encontrados = encontrados[:teto]
 
     cobertura["varridos"] = len(encontrados)
@@ -321,7 +321,7 @@ def absorver_diagnostico(cobertura: dict, diag: dict) -> None:
         cobertura["limitacoes"].append(dict(
             tipo=tipo, descricao=texto, afeta="arquivos", itens=diag[chave][:40]))
         cobertura["varridos"] = max(0, cobertura.get("varridos", 0) - len(diag[chave]))
-        rotulo = "ilegíveis" if tipo == "ilegivel" else "apontando para fora da raiz"
+        rotulo = "sem permissão de leitura" if tipo == "ilegivel" else "apontando para fora da raiz"
         for rel in diag[chave]:
             cobertura["nao_lidos"].append(dict(arquivo=rel, ext=chave_ext(Path(rel)),
                                                motivo=rotulo))
