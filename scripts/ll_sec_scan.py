@@ -17,6 +17,12 @@ Uso:
   ll_sec_scan.py recon  --root .
   ll_sec_scan.py scan   --root . --mode rapida
   ll_sec_scan.py render --root . --findings <f.json>
+
+Saída (exit code):
+  0  execução válida, sem achado bloqueante E cobertura requerida completa
+  1  erro de execução ou violação de contrato
+  2  achado bloqueante (crítico/alto)
+  3  auditoria incompleta (cobertura parcial ou nenhuma)
 """
 
 from __future__ import annotations
@@ -1047,6 +1053,28 @@ def montar_inventario(cobertura: dict) -> dict:
     return dict(codigo_do_projeto=codigo, excluidos_por_politica=politica,
                 extensoes=dict(sorted(cobertura.get("ext_do_projeto", {}).items(),
                                       key=lambda kv: (-kv[1], kv[0]))[:25]))
+
+
+def decidir_exit(dados: dict) -> int:
+    """Contrato de saída — e ele contempla COBERTURA, não só severidade.
+
+    Uma execução com 0 crítico e cobertura parcial saindo `0` seria recriar a
+    falha-aberta exatamente na fronteira com o CI, que é onde ela custa mais
+    caro: o gate aprova em silêncio. Os números importam menos que a regra —
+    **parcial nunca é 0**.
+
+      0  válida, sem achado bloqueante E cobertura requerida completa
+      1  erro de execução ou violação de contrato (levantado como ErroDeExecucao)
+      2  achado bloqueante (crítico/alto)
+      3  auditoria incompleta (cobertura parcial, nenhuma, ou snapshot divergente)
+    """
+    visiveis = [a for a in dados.get("achados", []) if not e_positivo(a)]
+    if any(a.get("severidade") in ("critico", "alto") for a in visiveis):
+        return 2
+    categorias = dados.get("categorias") or {}
+    if not categorias or any(c.get("cobertura") != "completa" for c in categorias.values()):
+        return 3
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -2255,7 +2283,9 @@ def cmd_scan(args):
                       "limitacoes": [l["descricao"] for l in cobertura["limitacoes"]],
                       "estado_dir": str(estado["dir"]),
                       "ignore_do_alvo": ignore_do_alvo,
-                      "escrita_no_alvo": "nenhuma"}, ensure_ascii=False, indent=2))
+                      "escrita_no_alvo": "nenhuma",
+                      "exit_code": decidir_exit(payload)}, ensure_ascii=False, indent=2))
+    return 0 if getattr(args, "exit_zero", False) else decidir_exit(payload)
 
 
 def cmd_render(args):
@@ -2339,12 +2369,15 @@ def cmd_render(args):
         {"data": dados.get("gerado_em", ""), "modo": dados.get("modo", ""),
          "fingerprints": [a["fingerprint"] for a in dados["achados"]]},
         ensure_ascii=False, indent=2))
+    saida_exit = decidir_exit(dados)
     print(json.dumps({"html": str(destino), "achados": len(dados["achados"]),
                       "estado_dir": str(estado["dir"]),
                       "categorias": {c: {k: v for k, v in d.items()
                                          if k in ("resultado", "cobertura", "limpo")}
                                      for c, d in categorias.items()},
-                      "escrita_no_alvo": "nenhuma"}, ensure_ascii=False, indent=2))
+                      "escrita_no_alvo": "nenhuma",
+                      "exit_code": saida_exit}, ensure_ascii=False, indent=2))
+    return 0 if getattr(args, "exit_zero", False) else saida_exit
 
 
 def main():
@@ -2364,6 +2397,8 @@ def main():
     p.add_argument("--out", default=None, help=ajuda_out)
     p.add_argument("--repo-id", dest="repo_id", default=None, help=ajuda_id)
     p.add_argument("--since", default=None, help="commit de referência para o modo diff")
+    p.add_argument("--exit-zero", dest="exit_zero", action="store_true",
+                   help="sempre sair com 0, mesmo com achado bloqueante ou cobertura parcial")
     p.set_defaults(f=cmd_scan)
 
     p = sub.add_parser("render")
@@ -2372,6 +2407,8 @@ def main():
     p.add_argument("--repo-id", dest="repo_id", default=None, help=ajuda_id)
     p.add_argument("--findings", required=True)
     p.add_argument("--uso", default=None, help="JSON do session_usage.py")
+    p.add_argument("--exit-zero", dest="exit_zero", action="store_true",
+                   help="sempre sair com 0, mesmo com achado bloqueante ou cobertura parcial")
     p.set_defaults(f=cmd_render)
 
     args = ap.parse_args()
