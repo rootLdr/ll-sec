@@ -8,13 +8,21 @@ supressões e renderização do HTML. O julgamento fica com o agente, que lê o
 JSON produzido aqui, confirma/descarta os achados lendo os arquivos e pode
 acrescentar achados próprios antes de renderizar.
 
-Só lê o repositório. As ÚNICAS escritas são dentro de <out> (pasta de
-relatórios) e uma linha no .gitignore, ambas explícitas.
+Só lê o repositório auditado: ZERO escrita dentro dele. Tudo o que a skill
+grava — findings.json, relatório HTML, estado, triagem — mora fora do alvo, em
+~/.local/state/ll-sec/<repo-id>/ (0700, arquivos 0600). Estado que influencia
+decisão não pode ficar do lado de dentro do que está sendo auditado.
 
 Uso:
   ll_sec_scan.py recon  --root .
-  ll_sec_scan.py scan   --root . --mode rapida --out ./ll-sec-relatorios
-  ll_sec_scan.py render --root . --out ./ll-sec-relatorios --findings <f.json>
+  ll_sec_scan.py scan   --root . --mode rapida
+  ll_sec_scan.py render --root . --findings <f.json>
+
+Saída (exit code):
+  0  execução válida, sem achado bloqueante E cobertura requerida completa
+  1  erro de execução ou violação de contrato
+  2  achado bloqueante (crítico/alto)
+  3  auditoria incompleta (cobertura parcial ou nenhuma)
 """
 
 from __future__ import annotations
@@ -953,20 +961,159 @@ def checar_permissao_arquivos_de_segredo(root: Path) -> list[dict]:
 # Estado, diff e supressões
 # --------------------------------------------------------------------------
 
-def carregar_supressoes(root: Path) -> dict[str, str]:
-    """`.ll-sec-ignore`: um fingerprint por linha + justificativa. A skill lê,
-    nunca escreve — aceitar risco é decisão do operador, não da ferramenta."""
-    arq = root / ".ll-sec-ignore"
-    sup: dict[str, str] = {}
+def raiz_do_estado() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or ""
+    raiz = Path(base) if os.path.isabs(base) else Path.home() / ".local" / "state"
+    return raiz / "ll-sec"
+
+
+def identificador_do_repo(root: Path, explicito: str | None = None) -> str:
+    """`<repo-id>` = hash do caminho absoluto resolvido + sufixo legível.
+
+    Nada aqui pode derivar do CONTEÚDO do repositório: um repositório hostil
+    forjaria a identidade de outro e herdaria as supressões dele — que é
+    exatamente a fronteira que o 0.7 acabou de fechar, entrando pela porta dos
+    fundos. Sinal de conteúdo pode INVALIDAR estado, nunca reivindicá-lo.
+    """
+    if explicito:
+        limpo = re.sub(r"[^A-Za-z0-9_.-]+", "-", explicito).strip("-.")
+        if not limpo:
+            raise ErroDeExecucao("--repo-id vazio depois de higienizado")
+        return limpo[:64]
+    h = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:12]
+    legivel = re.sub(r"[^A-Za-z0-9_-]+", "-", root.name).strip("-") or "repo"
+    return f"{h}-{legivel[:40]}"
+
+
+def _ids_da_pasta(p: Path) -> list:
+    try:
+        st = p.stat()
+        return [st.st_dev, st.st_ino]
+    except OSError:
+        return [0, 0]
+
+
+def abrir_estado(root: Path, repo_id: str | None = None) -> dict:
+    """Abre (e cria) o diretório de estado do auditor, FORA do repositório.
+
+    Duas armadilhas, uma em cada direção. Caminho sozinho reaproveita estado
+    errado: apagar o repositório A e clonar B no mesmo caminho faria B herdar a
+    triagem, os falsos positivos e os riscos aceitos de A — e depois de 0.7/0.9
+    a memória tem autoridade sobre o que a auditoria cala, então isso é falha de
+    segurança, não inconveniência. Conteúdo do repositório, por outro lado, não
+    pode reivindicar identidade nenhuma.
+
+    O que sobra é uma HEURÍSTICA CONSERVADORA, não uma identidade: casam sinais
+    físicos (caminho canônico, dev/ino da raiz e do .git); qualquer divergência
+    vira reset com aviso no relatório. Se o filesystem reciclar o mesmo inode no
+    mesmo dev, a tripla volta a casar e a substituição passa — está declarado
+    aqui de propósito, porque para ferramenta de segurança falso reset é sempre
+    melhor que falso reaproveitamento.
+    """
+    rid = identificador_do_repo(root, repo_id)
+    base = raiz_do_estado()
+    pasta = base / rid
+    base.mkdir(parents=True, exist_ok=True)
+    os.chmod(base, 0o700)
+    pasta.mkdir(parents=True, exist_ok=True)
+    os.chmod(pasta, 0o700)
+
+    agora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    st_raiz = _ids_da_pasta(root)
+    st_git = _ids_da_pasta(root / ".git")
+    atual = dict(canonical_path=str(root), st_dev=st_raiz[0], st_ino=st_raiz[1],
+                 git_dev=st_git[0], git_ino=st_git[1],
+                 ctime_raiz=int(root.stat().st_ctime) if root.exists() else 0,
+                 mtime_raiz=int(root.stat().st_mtime) if root.exists() else 0,
+                 first_seen=agora, repo_id=rid, id_explicito=bool(repo_id))
+
+    arq_id = pasta / "identidade.json"
+    reset, motivo, primeira = False, "", True
+    if arq_id.exists():
+        try:
+            antigo = json.loads(arq_id.read_text(encoding="utf-8"))
+            primeira = False
+        except Exception:
+            antigo, primeira = {}, True
+        divergiu = [c for c in ("canonical_path", "st_dev", "st_ino", "git_dev", "git_ino")
+                    if antigo.get(c) != atual[c]]
+        if antigo and divergiu:
+            reset = True
+            motivo = ("a identidade física do repositório mudou desde a última execução "
+                      f"({', '.join(divergiu)}); a linha de base anterior NÃO foi aplicada. "
+                      "Mover, reclonar ou substituir o projeto começa do zero de propósito — "
+                      "falso reset é melhor que herdar a memória de outro repositório.")
+            carimbo = datetime.now().strftime("%Y%m%d-%H%M%S")
+            for nome in ("estado.json", "triagem.json", "supressoes.json"):
+                alvo = pasta / nome
+                if alvo.exists():
+                    alvo.rename(pasta / f"{nome}.pre-reset-{carimbo}")
+        elif antigo:
+            atual["first_seen"] = antigo.get("first_seen", agora)
+
+    escrever_estado(arq_id, json.dumps(atual, ensure_ascii=False, indent=2))
+    rel = pasta / "relatorios"
+    rel.mkdir(parents=True, exist_ok=True)
+    os.chmod(rel, 0o700)
+    return dict(dir=pasta, relatorios=rel, identidade=atual,
+                reset=reset, motivo_reset=motivo, primeira_vez=primeira or reset)
+
+
+def escrever_estado(caminho: Path, texto: str) -> None:
+    """Todo arquivo do estado nasce 0600. O que mora ali é o mapa de
+    vulnerabilidade de TODOS os projetos da máquina reunidos num diretório só —
+    a concentração é ativo novo e precisa ser tratada como tal."""
+    caminho.write_text(texto, encoding="utf-8")
+    os.chmod(caminho, 0o600)
+
+
+def carregar_supressoes(estado_dir: Path) -> dict[str, str]:
+    """Supressão efetiva: `supressoes.json` no estado do AUDITOR, fora do alvo.
+
+    A skill lê, nunca escreve — aceitar risco é decisão do operador, não da
+    ferramenta. O que mudou é de ONDE ela lê: enquanto a lista vinha de dentro
+    do repositório auditado, o próprio auditado entregava, junto com o código,
+    a lista dos achados que queria silenciados.
+    """
+    arq = estado_dir / "supressoes.json"
     if not arq.exists():
-        return sup
-    for linha in arq.read_text(encoding="utf-8", errors="replace").splitlines():
+        return {}
+    try:
+        dados = json.loads(arq.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(dados, dict):
+        return {}
+    return {str(k): (str(v) if v else "(sem justificativa)") for k, v in dados.items()}
+
+
+def ler_ignore_do_alvo(root: Path) -> dict:
+    """`.ll-sec-ignore` do repositório auditado: INFORMAÇÃO, nunca instrução.
+
+    O arquivo continua sendo lido — e o que ele pede aparece no relatório —,
+    mas não silencia mais nada. Conteúdo do alvo é dado sob análise; deixá-lo
+    escolher o que a auditoria cala é entregar o silêncio a quem está sendo
+    auditado. Não há flag para religar isso: um CLAUDE.md hostil, que já está
+    no contexto antes de a skill ativar, mandaria o agente usar a flag.
+    """
+    arq = root / ".ll-sec-ignore"
+    info = dict(existe=False, arquivo=".ll-sec-ignore", pedidos=[], aplicado=False)
+    if not arq.exists() or not dentro_da_raiz(arq, root):
+        return info
+    info["existe"] = True
+    try:
+        linhas = arq.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return info
+    for linha in linhas:
         linha = linha.strip()
         if not linha or linha.startswith("#"):
             continue
         partes = re.split(r"[\s|]+", linha, maxsplit=1)
-        sup[partes[0]] = partes[1].strip() if len(partes) > 1 else "(sem justificativa)"
-    return sup
+        info["pedidos"].append(dict(
+            fingerprint=partes[0][:64],
+            justificativa=(partes[1].strip() if len(partes) > 1 else "(sem justificativa)")[:300]))
+    return info
 
 
 def aplicar_diff(achados: list[dict], estado_path: Path) -> dict:
@@ -993,20 +1140,34 @@ def aplicar_diff(achados: list[dict], estado_path: Path) -> dict:
             "resolvidos": len(resolvidos), "fingerprints_resolvidos": resolvidos}
 
 
-def garantir_gitignore(root: Path, pasta: str) -> str:
-    """O relatório é um mapa de vulnerabilidades: se vazar, é presente para o
-    atacante. Esta é a única escrita permitida fora da pasta de relatórios."""
-    gi = root / ".gitignore"
-    alvo = pasta.rstrip("/") + "/"
-    if gi.exists():
-        conteudo = gi.read_text(encoding="utf-8", errors="replace")
-        if alvo in conteudo or pasta in conteudo.split():
-            return "ja_estava"
-        with gi.open("a", encoding="utf-8") as f:
-            f.write(f"\n# ll-sec — relatorios de seguranca (mapa de vulnerabilidades). NUNCA versionar.\n{alvo}\n")
-        return "adicionado"
-    gi.write_text(f"# ll-sec — relatorios de seguranca. NUNCA versionar.\n{alvo}\n", encoding="utf-8")
-    return "criado"
+# `garantir_gitignore` foi REMOVIDA, não corrigida. Ela existia porque o
+# relatório morava dentro do repositório auditado; agora o relatório sai em
+# ~/.local/state/ll-sec/<repo-id>/relatorios/ e a skill passa a ter ZERO
+# escrita dentro do alvo. Some com ela a checagem por substring que aceitava
+# entrada comentada (`# ll-sec-relatorios/ (desativado)` devolvia "ja_estava" e
+# o mapa de vulnerabilidades ficava versionável) e some a única exceção do
+# contrato "somente leitura", cuja própria docstring admitia ser exceção.
+
+
+def resolver_saida(root: Path, out_arg: str | None, estado: dict) -> Path:
+    """Onde o relatório é gravado. Dentro da raiz auditada é ERRO, não opção.
+
+    Não é preferência de estilo: saída dentro da árvore varrida realimenta a
+    varredura seguinte (o findings.json vira achado do próximo scan) e devolve
+    ao alvo o poder de plantar estado pré-fabricado."""
+    if not out_arg:
+        return estado["relatorios"]
+    destino = Path(out_arg).expanduser()
+    if not destino.is_absolute():
+        destino = (Path.cwd() / destino)
+    destino = destino.resolve()
+    if destino == root or destino.is_relative_to(root):
+        raise ErroDeExecucao(
+            f"--out aponta para dentro do repositório auditado ({destino}). "
+            "A skill não escreve nada dentro do alvo: sem --out, o relatório sai em "
+            f"{estado['relatorios']}.")
+    destino.mkdir(parents=True, exist_ok=True)
+    return destino
 
 
 # --------------------------------------------------------------------------
@@ -1404,7 +1565,9 @@ confirmar. Os itens da aba "Verificado e OK" não entram nesta contagem.</p>
 <h1>Auditoria de segurança — {esc(ctx['projeto'])}</h1>
 <div class="sub">{esc(ctx['gerado_em'])} · modo <b>{esc(ctx['modo'])}</b> · somente leitura, nenhum código alterado</div>
 <div class="aviso"><b>Este arquivo é um mapa de vulnerabilidades.</b> Não commite, não anexe em
-ticket público e não mande por canal inseguro. A pasta de relatórios foi mantida fora do Git.</div>
+ticket público e não mande por canal inseguro. Ele foi gravado <b>fora do repositório auditado</b>
+(<code>{esc(ctx.get('saida', ''))}</code>), com permissão 600 — a auditoria não escreveu um byte
+dentro do projeto.</div>
 <div class="meta">{uso_txt}</div>
 {bloco_diff}
 <div class="placar">{placar}</div>
@@ -1431,15 +1594,30 @@ def cmd_recon(args):
 
 def cmd_scan(args):
     root = Path(args.root).resolve()
-    out = Path(args.out) if os.path.isabs(args.out) else root / args.out
-    out.mkdir(parents=True, exist_ok=True)
+    if not root.is_dir():
+        raise ErroDeExecucao(f"--root não é um diretório: {root}")
+    # O estado do auditor vive FORA do repositório auditado. Estado que
+    # influencia decisão (supressão, triagem, linha de base) não pode ficar do
+    # lado de dentro: repo hostil traria um estado.json fabricado e o diff da
+    # primeira execução já nasceria mentindo "9 resolvidos".
+    estado = abrir_estado(root, getattr(args, "repo_id", None))
+    out = resolver_saida(root, args.out, estado)
 
     recon = detectar_stacks(root)
     arquivos, cobertura = listar_arquivos(root, args.mode, args.since)
     achados, diag = varrer(root, arquivos, recon["stacks"])
     absorver_diagnostico(cobertura, diag)
 
-    sup = carregar_supressoes(root)
+    ignore_do_alvo = ler_ignore_do_alvo(root)
+    if ignore_do_alvo["existe"]:
+        cobertura["limitacoes"].append(dict(
+            tipo="ignore_do_alvo",
+            descricao=(f"o repositório auditado pede, no .ll-sec-ignore, para ignorar "
+                       f"{len(ignore_do_alvo['pedidos'])} achado(s). O pedido é informação de "
+                       "auditoria, não instrução: NADA foi silenciado por causa dele."),
+            afeta="nenhum", itens=[q["fingerprint"] for q in ignore_do_alvo["pedidos"][:40]]))
+
+    sup = carregar_supressoes(estado["dir"])
     suprimidos = []
     restantes = []
     for a in achados:
@@ -1454,7 +1632,7 @@ def cmd_scan(args):
     # com estado "conhecido" — não vira "novo" no diff nem exige re-triagem,
     # a menos que o agente decida revê-lo. Para forçar re-triagem de um item,
     # apague a entrada dele no triagem.json.
-    caminho_triagem = out / "triagem.json"
+    caminho_triagem = estado["dir"] / "triagem.json"
     triagem = {}
     if caminho_triagem.exists():
         try:
@@ -1473,24 +1651,30 @@ def cmd_scan(args):
 
     # Fingerprints da execução anterior, guardados no payload para o render
     # decidir novo/persistente sobre a lista FINAL (pós-triagem do agente).
-    caminho_estado = out / "estado.json"
+    caminho_estado = estado["dir"] / "estado.json"
     try:
         anteriores = json.loads(caminho_estado.read_text(encoding="utf-8")).get("fingerprints", [])
     except Exception:
         anteriores = []
 
     diff = aplicar_diff(restantes, caminho_estado)
-    gitignore = garantir_gitignore(root, out.name if not os.path.isabs(args.out) else args.out)
+    if estado["reset"]:
+        cobertura["limitacoes"].append(dict(
+            tipo="reset_de_identidade", descricao=estado["motivo_reset"],
+            afeta="diff", itens=[]))
 
     payload = dict(
         projeto=root.name, root=str(root), modo=args.mode,
         gerado_em=datetime.now().strftime("%d/%m/%Y %H:%M"),
         recon=recon, cobertura=cobertura, achados=restantes,
-        suprimidos=suprimidos, diff=diff, gitignore=gitignore,
-        limitacoes=[], uso={}, estado_anterior=anteriores,
+        suprimidos=suprimidos, diff=diff,
+        limitacoes=cobertura["limitacoes"], uso={}, estado_anterior=anteriores,
+        ignore_do_alvo=ignore_do_alvo, estado_dir=str(estado["dir"]),
+        identidade=estado["identidade"], reset_de_identidade=estado["motivo_reset"],
+        saida=str(out),
     )
     destino = out / "findings.json"
-    destino.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    escrever_estado(destino, json.dumps(payload, ensure_ascii=False, indent=2))
 
     # O estado NÃO é gravado aqui de propósito: quem fecha a execução é o render,
     # que conhece a lista final depois da triagem. Gravar os achados crus faria a
@@ -1500,13 +1684,23 @@ def cmd_scan(args):
     print(json.dumps({"findings_json": str(destino), "total": len(restantes),
                       "por_severidade": resumo, "suprimidos": len(suprimidos),
                       "diff": diff, "recon": recon, "cobertura": cobertura,
-                      "gitignore": gitignore}, ensure_ascii=False, indent=2))
+                      "estado_dir": str(estado["dir"]),
+                      "ignore_do_alvo": ignore_do_alvo,
+                      "escrita_no_alvo": "nenhuma"}, ensure_ascii=False, indent=2))
 
 
 def cmd_render(args):
     dados = json.loads(Path(args.findings).read_text(encoding="utf-8"))
-    out = Path(args.out) if os.path.isabs(args.out) else Path(dados["root"]) / args.out
-    out.mkdir(parents=True, exist_ok=True)
+    root = Path(args.root).resolve()
+    # A raiz vem da linha de comando, não do findings.json: o arquivo passa pelas
+    # mãos do agente entre o scan e o render, e caminho de escrita não é campo
+    # que dado de entrada tenha o direito de escolher.
+    if dados.get("root") and Path(dados["root"]).resolve() != root:
+        raise ErroDeExecucao(
+            f"o findings.json foi gerado para {dados['root']}, mas --root aponta para {root}. "
+            "Rode o render com a mesma raiz do scan.")
+    estado = abrir_estado(root, getattr(args, "repo_id", None))
+    out = resolver_saida(root, args.out, estado)
 
     if args.uso and Path(args.uso).exists():
         try:
@@ -1542,12 +1736,14 @@ def cmd_render(args):
     proj = re.sub(r"[^A-Za-z0-9_-]+", "-", dados.get("projeto", "projeto")).strip("-") or "projeto"
     nome = f"ll-sec-{proj}-{modo_label}-{datetime.now().strftime('%Y-%m-%d-%H%M')}.html"
     destino = out / nome
-    destino.write_text(render_html(dados), encoding="utf-8")
+    dados["saida"] = str(out)
+    dados["estado_dir"] = str(estado["dir"])
+    escrever_estado(destino, render_html(dados))
 
     # Memória de triagem: cada achado da lista final grava sua classificação por
     # fingerprint. Na próxima varredura o scan pré-aplica isso e marca o item
     # como "conhecido" — o diff para de acusar novidade no que já foi triado.
-    tri_path = out / "triagem.json"
+    tri_path = estado["dir"] / "triagem.json"
     try:
         tri = json.loads(tri_path.read_text(encoding="utf-8"))
     except Exception:
@@ -1559,15 +1755,16 @@ def cmd_render(args):
         ent["arquivo"] = a.get("arquivo", "")
         ent["data"] = a.get("triado_em") or dados.get("gerado_em", "")
         tri[a["fingerprint"]] = ent
-    tri_path.write_text(json.dumps(tri, ensure_ascii=False, indent=1), encoding="utf-8")
+    escrever_estado(tri_path, json.dumps(tri, ensure_ascii=False, indent=1))
 
     # Fecha a execução: o estado passa a ser a lista que o operador de fato viu.
-    (out / "estado.json").write_text(json.dumps(
+    escrever_estado(estado["dir"] / "estado.json", json.dumps(
         {"data": dados.get("gerado_em", ""), "modo": dados.get("modo", ""),
          "fingerprints": [a["fingerprint"] for a in dados["achados"]]},
-        ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({"html": str(destino), "achados": len(dados["achados"])},
-                     ensure_ascii=False, indent=2))
+        ensure_ascii=False, indent=2))
+    print(json.dumps({"html": str(destino), "achados": len(dados["achados"]),
+                      "estado_dir": str(estado["dir"]),
+                      "escrita_no_alvo": "nenhuma"}, ensure_ascii=False, indent=2))
 
 
 def main():
@@ -1576,18 +1773,29 @@ def main():
 
     p = sub.add_parser("recon"); p.add_argument("--root", default="."); p.set_defaults(f=cmd_recon)
 
+    ajuda_out = ("pasta de saída — precisa ficar FORA do repositório auditado. "
+                 "Sem --out, sai no estado do auditor (~/.local/state/ll-sec/<repo-id>/relatorios)")
+    ajuda_id = ("identificador explícito do estado, para continuar a mesma linha de base "
+                "depois de mover ou reclonar o projeto")
+
     p = sub.add_parser("scan")
     p.add_argument("--root", default=".")
     p.add_argument("--mode", choices=["rapida", "completa", "diff"], default="rapida")
-    p.add_argument("--out", default="./ll-sec-relatorios")
+    p.add_argument("--out", default=None, help=ajuda_out)
+    p.add_argument("--repo-id", dest="repo_id", default=None, help=ajuda_id)
     p.add_argument("--since", default=None, help="commit de referência para o modo diff")
+    p.add_argument("--exit-zero", dest="exit_zero", action="store_true",
+                   help="sempre sair com 0, mesmo com achado bloqueante ou cobertura parcial")
     p.set_defaults(f=cmd_scan)
 
     p = sub.add_parser("render")
     p.add_argument("--root", default=".")
-    p.add_argument("--out", default="./ll-sec-relatorios")
+    p.add_argument("--out", default=None, help=ajuda_out)
+    p.add_argument("--repo-id", dest="repo_id", default=None, help=ajuda_id)
     p.add_argument("--findings", required=True)
     p.add_argument("--uso", default=None, help="JSON do session_usage.py")
+    p.add_argument("--exit-zero", dest="exit_zero", action="store_true",
+                   help="sempre sair com 0, mesmo com achado bloqueante ou cobertura parcial")
     p.set_defaults(f=cmd_render)
 
     args = ap.parse_args()
