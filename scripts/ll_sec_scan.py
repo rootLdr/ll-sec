@@ -1681,7 +1681,28 @@ th{color:#8b949e;font-weight:600;font-size:11.5px;text-transform:uppercase;lette
 .selo{color:#000;background:#f6f8fa}.leg-n,.leg-c{color:#000}.leg-on{background:#f6f8fa}
 .bloco-inv,.bloco-check,.lim{background:#fff;border-color:#ccc;break-inside:avoid}
 .bloco-inv h3,.cab-check,.linha-inv b,.sec-cob{color:#000}
-.eixo{color:#000;background:#f6f8fa}.gaps ul{color:#000}}
+.eixo{color:#000;background:#f6f8fa}.gaps ul{color:#000}
+/* No papel o fundo vira branco, mas os tokens do tema escuro continuavam
+   claros: azul 1,95:1, amarelo 1,50:1, vermelho 1,97:1 sobre branco — 255
+   dos 872 nos de texto reprovavam em WCAG AA na impressao. As regras abaixo
+   usam !important de proposito: e uma folha de impressao, e sem isso as
+   regras de duas classes da tela (.tag.sev-critico e afins) ganham por
+   especificidade e o fundo escuro sobrevive no papel. */
+.wrap,.wrap *{color:#1f2328!important;text-shadow:none!important}
+.num,.tag,.nota-sel,.selo,.eixo,.aviso,.lim,.diff,.card,.meta,.amostra,
+.q-agente,.q-operador,.q-ambos,.q-nenhuma,.pt-sim,.pt-nao,.e-limpo,
+.e-achado,.e-nada,.c-completa,.c-parcial,.c-nenhuma,.c-na,.nota-ok,
+.linha-inv.destaque{background:#f6f8fa!important;border-color:#8c959f!important}
+.sub,.card .l,.tag,.q-nenhuma,.pt-nao,.leg-rod,.e-nada,.sub-inv,.just,
+.ver-cap,.gaps summary,.nota-sel.n1,.tag.nota-sel.n1{color:#4b535d!important}
+.loc,.leg-c,.simples b,.q-ambos,.nota-sel.n2,.tag.sev-baixo,.c-na,
+.card.persist{color:#0550ae!important}
+.tab-ok,.item.positivo,.q-agente,.e-limpo,.c-completa,
+.card.resolv{color:#0f5323!important}
+.nota-sel.n5,.nota-sel.n4,.tag.sev-critico,.tag.sev-alto,.tag.est-novo,
+.c-nenhuma,.sem-check,.e-achado,.q-operador{color:#8b1a2b!important}
+.nota-sel.n3,.tag.sev-medio,.pt-sim,.c-parcial,.linha-inv.destaque span,
+.lim b,.bloco-inv .destaque{color:#6b4b00!important}}
 """
 
 JS = """
