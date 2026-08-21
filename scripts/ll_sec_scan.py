@@ -224,6 +224,7 @@ REGRAS = [
     # ---------------- C1 — banco sem tranca / RLS ----------------
     dict(id="C1-firestore-aberto", cat="C1", sev="critico",
          titulo="Regra de banco liberada para qualquer um",
+         mascarar=False,
          rx=R(r"allow\s+(read|write|create|update|delete|read,\s*write)[^;]*:\s*if\s+true"),
          ext={".rules"},
          explica="A regra libera a operação sem nenhuma condição. Qualquer pessoa com o "
@@ -231,6 +232,7 @@ REGRAS = [
          confirma="Abrir o arquivo de regras e verificar se essa cláusula está em produção."),
     dict(id="C1-firestore-so-logado", cat="C1", sev="alto",
          titulo="Regra exige apenas estar logado, sem checar dono do dado",
+         mascarar=False,
          rx=R(r"allow\s+(read|write|create|update|delete|read,\s*write)[^;]*:\s*if\s+request\.auth\s*!=\s*null\s*;"),
          ext={".rules"},
          explica="Qualquer usuário autenticado — inclusive um recém-cadastrado — alcança "
@@ -238,6 +240,7 @@ REGRAS = [
          confirma="Verificar se a coleção guarda dado de um usuário específico."),
     dict(id="C1-rls-desligada", cat="C1", sev="critico",
          titulo="Row Level Security desativada explicitamente",
+         mascarar=False,
          rx=R(r"alter\s+table\s+[^\s;]+\s+disable\s+row\s+level\s+security"),
          ext={".sql"},
          explica="Desligar RLS no Postgres do Supabase expõe a tabela inteira à chave "
@@ -245,6 +248,7 @@ REGRAS = [
          confirma="Conferir se a tabela é alcançável pela API pública."),
     dict(id="C1-policy-permissiva", cat="C1", sev="alto",
          titulo="Policy de RLS com condição sempre verdadeira",
+         mascarar=False,
          rx=R(r"create\s+policy[\s\S]{0,200}?using\s*\(\s*true\s*\)"),
          ext={".sql"},
          explica="A policy existe mas não filtra nada: `using (true)` autoriza toda linha "
@@ -252,6 +256,7 @@ REGRAS = [
          confirma="Ver se a tabela contém dado de mais de um usuário/tenant."),
     dict(id="C1-grant-public", cat="C1", sev="alto",
          titulo="Permissão ampla concedida a PUBLIC",
+         mascarar=False,
          rx=R(r"grant\s+(all|select|insert|update|delete)[^;]{0,80}\bto\s+public\b"),
          ext={".sql"},
          explica="`TO PUBLIC` alcança qualquer papel do banco, inclusive o anônimo.",
@@ -259,6 +264,10 @@ REGRAS = [
     dict(id="C1-service-role-no-cliente", cat="C1", sev="critico",
          titulo="Chave de serviço (service_role) usada em código de cliente",
          rx=R(r"(service_role|SUPABASE_SERVICE_ROLE|serviceRoleKey|FIREBASE_ADMIN)"),
+         # É o segredo mais perigoso que a ferramenta sabe achar e era o único
+         # que saía cru no HTML: a mesma linha casava também o C4-jwt-literal,
+         # que saía mascarado, então a assinatura do JWT aparecia duas vezes.
+         mascarar=True,
          ext={".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte"},
          caminho_exige=R(r"(client|components?|pages?|app|public|frontend|src)"),
          caminho_nao=R(r"(server|api|route\.|actions?|lib/server|\.server\.)"),
@@ -269,12 +278,14 @@ REGRAS = [
     # ---------------- C2 — autorização no front-end ----------------
     dict(id="C2-role-no-storage", cat="C2", sev="alto",
          titulo="Papel/permissão lido de localStorage ou sessionStorage",
+         mascarar=False,
          rx=R(r"(localStorage|sessionStorage)\.(getItem\(\s*['\"][^'\"]*(admin|role|perm|is_?admin|nivel)|[a-z_]*\b(isAdmin|role))"),
          explica="O usuário edita localStorage em dois cliques. Se a permissão vem dali, "
                  "virar admin é digitar uma linha no console.",
          confirma="Ver se o servidor revalida esse papel antes de liberar a ação."),
     dict(id="C2-guard-so-visual", cat="C2", sev="medio",
          titulo="Permissão decidida no componente, possivelmente sem checagem no servidor",
+         mascarar=False,
          # `\w*\.` no meio é OPCIONAL de propósito: o caso mais comum é
          # `user.role === "admin"` (um ponto só). Exigir dois pontos fazia a
          # regra passar batido justamente na forma mais frequente.
@@ -289,12 +300,14 @@ REGRAS = [
     # ---------------- C3 — IDOR ----------------
     dict(id="C3-idor-consulta-por-id", cat="C3", sev="alto",
          titulo="Consulta por ID vindo da requisição sem filtro de dono",
+         mascarar=False,
          rx=R(r"(findUnique|findFirst|findOne|findById|get\()\s*\(?\s*\{?[^)}]{0,120}(id\s*:\s*(req\.|request\.|params\.|ctx\.params|searchParams))"),
          explica="O identificador vem do cliente e vira consulta direta. Trocar o número na "
                  "URL devolve o dado de outra pessoa (IDOR).",
          confirma="Verificar se a consulta também filtra por usuário/tenant da sessão."),
     dict(id="C3-idor-sql-por-id", cat="C3", sev="alto",
          titulo="SQL filtrando só por id vindo da requisição",
+         mascarar=False,
          rx=R(r"where\s+id\s*=\s*[\$'\"]?\s*(\+|\$\{|%s|\?)?[^;]{0,40}(req\.|request\.|params|query\[)"),
          explica="Mesma falha do IDOR, agora em SQL cru: sem cláusula de dono, o id do "
                  "cliente decide o que sai do banco.",
@@ -342,28 +355,33 @@ REGRAS = [
     # ---------------- C5 — input sem sanitização / XSS ----------------
     dict(id="C5-innerhtml", cat="C5", sev="medio",
          titulo="HTML montado a partir de valor dinâmico",
+         mascarar=False,
          rx=R(r"(\.innerHTML\s*=|\.outerHTML\s*=|document\.write\s*\(|insertAdjacentHTML\s*\()"),
          explica="Se o valor vier do usuário, o navegador executa o script que ele mandar "
                  "(XSS) — sequestro de sessão, ação em nome da vítima.",
          confirma="Rastrear a origem do valor: veio de input, URL, banco ou é constante?"),
     dict(id="C5-dangerously", cat="C5", sev="medio",
          titulo="dangerouslySetInnerHTML / v-html com valor dinâmico",
+         mascarar=False,
          rx=R(r"(dangerouslySetInnerHTML|v-html\s*=)"),
          explica="A API existe para casos em que o HTML é confiável. Com valor de usuário, é XSS.",
          confirma="Ver se o conteúdo passa por sanitizador (DOMPurify, sanitize-html)."),
     dict(id="C5-eval", cat="C5", sev="alto",
          titulo="Execução dinâmica de código",
+         mascarar=False,
          rx=R(r"(\beval\s*\(|new\s+Function\s*\(|\bexec\s*\(\s*[`'\"]?\s*\$\{|setTimeout\s*\(\s*['\"])"),
          explica="Executar string como código transforma qualquer input em execução remota.",
          confirma="Verificar se a string tem qualquer parte controlada pelo usuário."),
     dict(id="C5-sql-concatenado", cat="C5", sev="critico",
          titulo="SQL montado por concatenação ou interpolação",
+         mascarar=False,
          rx=R(r"(query|execute|raw|prepare)\s*\(\s*[`'\"](?:[^`'\"]*?)(SELECT|INSERT|UPDATE|DELETE)[\s\S]{0,120}?(\+\s*\w|\$\{|%\s*\(|\bf['\"])"),
          explica="Injeção de SQL: o usuário passa a escrever parte da consulta. Dá para ler "
                  "tabela inteira, autenticar-se como outro ou apagar dados.",
          confirma="Confirmar que o trecho interpolado vem do usuário e trocar por parâmetro."),
     dict(id="C5-comando-shell", cat="C5", sev="critico",
          titulo="Comando de sistema montado com valor dinâmico",
+         mascarar=False,
          rx=R(r"(child_process\.)?(exec|execSync|spawnSync)\s*\(\s*[`'\"][^`'\"]*\$\{|os\.system\s*\(\s*f['\"]|subprocess\.\w+\([^)]*shell\s*=\s*True"),
          explica="Injeção de comando: o usuário emenda `; rm -rf` e o servidor obedece.",
          confirma="Ver a origem da variável e trocar por execução com lista de argumentos."),
@@ -371,12 +389,14 @@ REGRAS = [
     # ---------------- C6 — autenticação e sessão ----------------
     dict(id="C6-jwt-sem-verificacao", cat="C6", sev="critico",
          titulo="JWT decodificado sem verificar assinatura",
+         mascarar=False,
          rx=R(r"(jwt\.decode\s*\(|jwtDecode\s*\(|decodeJwt\s*\(|verify\s*:\s*false|verify_signature['\"]?\s*:\s*False)"),
          explica="Decodificar não é validar. Sem conferir a assinatura, qualquer pessoa forja "
                  "um token dizendo que é admin.",
          confirma="Ver se existe um `verify` com a chave em algum ponto do fluxo."),
     dict(id="C6-alg-none", cat="C6", sev="critico",
          titulo="Algoritmo 'none' aceito na validação de token",
+         mascarar=False,
          rx=R(r"algorithms?\s*[:=]\s*\[?\s*['\"]none['\"]"),
          explica="`alg: none` significa token sem assinatura: forjar é trivial.",
          confirma="Fixar a lista de algoritmos permitidos."),
@@ -389,6 +409,7 @@ REGRAS = [
          confirma="Mover para variável de ambiente e invalidar tokens emitidos."),
     dict(id="C6-cookie-inseguro", cat="C6", sev="baixo",
          titulo="Cookie de sessão sem httpOnly/secure/sameSite",
+         mascarar=False,
          rx=R(r"(res\.cookie|cookies\(\)\.set|setCookie|document\.cookie\s*=)"),
          explica="Sem `httpOnly` um XSS lê a sessão; sem `secure` ela trafega em claro; sem "
                  "`sameSite` fica exposta a CSRF.",
@@ -397,30 +418,35 @@ REGRAS = [
     # ---------------- C7 — CSRF, CORS, headers, redirect, SSRF ----------------
     dict(id="C7-cors-aberto", cat="C7", sev="alto",
          titulo="CORS liberado para qualquer origem",
+         mascarar=False,
          rx=R(r"(origin\s*:\s*['\"]\*['\"]|Access-Control-Allow-Origin['\"]?\s*[,:]\s*['\"]\*['\"]|cors\(\s*\)|origin\s*:\s*true)"),
          explica="Origem `*` combinada com credenciais deixa qualquer site chamar a API "
                  "com o cookie da vítima.",
          confirma="Verificar se `credentials: true` está junto — aí a severidade sobe."),
     dict(id="C7-cors-refletido", cat="C7", sev="alto",
          titulo="Origem do requisitante refletida sem allowlist",
+         mascarar=False,
          rx=R(r"Access-Control-Allow-Origin['\"]?\s*[,:]\s*(req|request)\.(headers)?[\.\[]"),
          explica="Refletir o `Origin` recebido equivale a liberar todo mundo, só que "
                  "passando pela checagem do navegador.",
          confirma="Conferir se há lista de origens permitidas antes da reflexão."),
     dict(id="C7-open-redirect", cat="C7", sev="medio",
          titulo="Redirecionamento para destino controlado pelo usuário",
+         mascarar=False,
          rx=R(r"(redirect|location)\s*\(?\s*=?\s*(req|request)\.(query|params|body)"),
          explica="Open redirect: o atacante manda um link do seu domínio que joga a vítima "
                  "no site dele. Base clássica de phishing.",
          confirma="Verificar se o destino é validado contra uma allowlist."),
     dict(id="C7-ssrf", cat="C7", sev="alto",
          titulo="Requisição do servidor para URL vinda do usuário (SSRF)",
+         mascarar=False,
          rx=R(r"(fetch|axios\.(get|post)|requests\.(get|post)|urlopen|HttpClient)\s*\(\s*(req|request)\.(query|body|params)"),
          explica="O servidor busca a URL que o usuário mandar — inclusive endereços internos "
                  "e metadados de nuvem (169.254.169.254).",
          confirma="Ver se há validação de esquema e host antes da chamada."),
     dict(id="C7-mutacao-por-get", cat="C7", sev="medio",
          titulo="Operação que altera estado exposta em GET",
+         mascarar=False,
          rx=R(r"\.get\s*\(\s*['\"][^'\"]*(delete|remove|create|update|add|set|reset|drop)[^'\"]*['\"]"),
          explica="Mudar estado por GET é acionável por uma tag de imagem em outro site (CSRF), "
                  "e ainda pode ser disparado por pré-carregamento do navegador.",
@@ -429,6 +455,7 @@ REGRAS = [
     # ---------------- C9 — tentativa de manipular a auditoria ----------------
     dict(id="C9-prompt-injection", cat="C9", sev="alto",
          titulo="Texto no repositório tentando direcionar a análise da IA",
+         mascarar=False,
          rx=R(r"(ignore\s+(all\s+)?(previous|prior|above)\s+instructions"
               r"|ignore\s+(este|esse)\s+arquivo"
               r"|(este|esse)\s+(arquivo|c[óo]digo)\s+j[áa]\s+(foi|est[áa])\s+auditad"
@@ -532,7 +559,10 @@ def varrer(root: Path, arquivos: list[Path], stacks: list[str]) -> list[dict]:
                 achados.append(dict(
                     fingerprint=fp, regra=regra["id"], categoria=regra["cat"],
                     severidade=sev, titulo=regra["titulo"], arquivo=rel, linha=linha_n,
-                    trecho=mascarar(trecho) if regra.get("mascarar") else trecho[:300],
+                    # Mascarar é o DEFAULT: só sai cru a regra que declarou
+                    # `mascarar=False`. Regra nova nasce protegida — o defeito
+                    # anterior era o inverso, a regra nascia vazando.
+                    trecho=trecho[:300] if regra.get("mascarar") is False else mascarar(trecho),
                     explicacao=regra["explica"], como_confirmar=regra["confirma"],
                     nota=nota, origem="padrao", estado="novo",
                 ))
