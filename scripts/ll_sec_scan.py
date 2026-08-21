@@ -17,12 +17,6 @@ Uso:
   ll_sec_scan.py recon  --root .
   ll_sec_scan.py scan   --root . --mode rapida
   ll_sec_scan.py render --root . --findings <f.json>
-
-Saída (exit code):
-  0  execução válida, sem achado bloqueante E cobertura requerida completa
-  1  erro de execução ou violação de contrato
-  2  achado bloqueante (crítico/alto)
-  3  auditoria incompleta (cobertura parcial ou nenhuma)
 """
 
 from __future__ import annotations
@@ -155,7 +149,8 @@ def detectar_stacks(root: Path) -> dict:
 def listar_arquivos(root: Path, mode: str, since: str | None) -> tuple[list[Path], dict]:
     """Arquivos de código a varrer, já priorizados e com teto por modo."""
     cobertura = {"total_encontrados": 0, "varridos": 0, "cortados": 0, "motivo_corte": "",
-                 "limitacoes": []}
+                 "limitacoes": [], "nao_lidos": [], "degradacao_global": [],
+                 "inventario": {}, "ext_do_projeto": {}, "lidos": []}
 
     if mode == "diff":
         ref = since or "HEAD~1"
@@ -174,11 +169,12 @@ def listar_arquivos(root: Path, mode: str, since: str | None) -> tuple[list[Path
             cobertura["total_encontrados"] = len(arquivos)
             cobertura["varridos"] = len(arquivos)
             cobertura["ref_diff"] = ref
+            texto = (f"modo diff: só os {len(arquivos)} arquivos alterados desde `{ref}` foram "
+                     "varridos; o resto do repositório não foi olhado nesta execução")
             cobertura["limitacoes"].append(dict(
-                tipo="modo_diff",
-                descricao=(f"modo diff: só os {len(arquivos)} arquivos alterados desde `{ref}` "
-                           f"foram varridos. O resto do repositório não foi olhado nesta execução."),
-                afeta="todos", itens=[]))
+                tipo="modo_diff", descricao=texto, afeta="todos", itens=[]))
+            cobertura["degradacao_global"].append(texto)
+            cobertura["ext_do_projeto"] = contar_extensoes(arquivos, root)
             return arquivos, cobertura
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
                 FileNotFoundError, OSError) as e:
@@ -188,6 +184,7 @@ def listar_arquivos(root: Path, mode: str, since: str | None) -> tuple[list[Path
             cobertura["motivo_corte"] = motivo
             cobertura["limitacoes"].append(dict(
                 tipo="modo_diff_indisponivel", descricao=motivo, afeta="todos", itens=[]))
+            cobertura["degradacao_global"].append(motivo)
             mode = "rapida"
 
     inv: dict[str, list[Path]] = {k: [] for k in (
@@ -238,6 +235,14 @@ def listar_arquivos(root: Path, mode: str, since: str | None) -> tuple[list[Path
             "A raiz está errada, ou tudo ali é dependência/gerado/binário. "
             "Nenhum relatório foi emitido — auditoria sem arquivo não é auditoria limpa.")
 
+    for balde, rotulo in (("nao_reconhecido", "de tipo não reconhecido"),
+                          ("acima_do_limite", "acima do limite de tamanho"),
+                          ("ilegivel", "ilegíveis"),
+                          ("fora_da_raiz", "apontando para fora da raiz")):
+        for p_ in inv[balde]:
+            cobertura["nao_lidos"].append(dict(arquivo=rel_de(p_, root),
+                                               ext=chave_ext(p_), motivo=rotulo))
+
     if inv["fora_da_raiz"]:
         cobertura["limitacoes"].append(dict(
             tipo="fora_da_raiz",
@@ -283,6 +288,10 @@ def listar_arquivos(root: Path, mode: str, since: str | None) -> tuple[list[Path
             afeta="arquivos",
             itens=[rel_de(p, root) for p in cortados[:40]]))
         cobertura["ext_cortadas"] = contar_extensoes(cortados, root)
+        for p_ in cortados:
+            cobertura["nao_lidos"].append(dict(arquivo=rel_de(p_, root),
+                                               ext=chave_ext(p_),
+                                               motivo="cortados pelo orçamento do modo"))
         encontrados = encontrados[:teto]
 
     cobertura["varridos"] = len(encontrados)
@@ -306,6 +315,10 @@ def absorver_diagnostico(cobertura: dict, diag: dict) -> None:
         cobertura["limitacoes"].append(dict(
             tipo=tipo, descricao=texto, afeta="arquivos", itens=diag[chave][:40]))
         cobertura["varridos"] = max(0, cobertura.get("varridos", 0) - len(diag[chave]))
+        rotulo = "ilegíveis" if tipo == "ilegivel" else "apontando para fora da raiz"
+        for rel in diag[chave]:
+            cobertura["nao_lidos"].append(dict(arquivo=rel, ext=chave_ext(Path(rel)),
+                                               motivo=rotulo))
 
 
 def balde_do_diretorio(dirpath: Path, root: Path) -> str | None:
@@ -332,7 +345,12 @@ def rel_de(p: Path, root: Path) -> str:
 
 def chave_ext(p: Path) -> str:
     """A chave que decide se um check se aplica a um arquivo: a extensão, ou o
-    próprio nome quando o arquivo não tem extensão (.env, Dockerfile)."""
+    próprio nome quando o arquivo não tem extensão (.env, Dockerfile).
+
+    `.env.local` conta como `.env`, não como `.local`: quem lê o inventário
+    quer saber quantos arquivos de ambiente existem, não quantos sufixos."""
+    if p.name.startswith(".env"):
+        return ".env"
     return p.suffix.lower() or p.name
 
 
@@ -694,6 +712,341 @@ REGRAS = [
                  "sem revisão; os dois merecem explicação.",
          confirma="Ler o arquivo inteiro e descobrir quem introduziu o trecho (git blame)."),
 ]
+
+
+# --------------------------------------------------------------------------
+# Catálogo de checks — cobertura de CAPACIDADE
+# --------------------------------------------------------------------------
+# Cobertura tem dois andares, e confundi-los é o que deixa a categoria mentir
+# com sintaxe nova:
+#
+#   operacional — os checks declarados de fato rodaram sobre os arquivos elegíveis?
+#   capacidade  — quais checks a categoria SE PROPÕE a ter, e o que ficou de fora?
+#
+# Sem o segundo andar, uma C5 com `sql_injection` e `xss` completos sai
+# "cobertura: completa" enquanto `command_injection` e `template_injection`
+# nunca foram implementados. Por isso `known_gaps` é declarado, não implícito:
+# `completa` passa a significar exatamente "execução completa da capacidade
+# declarada" — nunca "provamos que não há injeção".
+#
+# E o efeito imediato de honestidade: a C8 nasce aqui com `checks: []`. A
+# categoria vazia deixa de conseguir se esconder atrás de um enum.
+
+CATALOGO = {
+    "C1": dict(capability_version=1, checks=[
+        dict(id="firebase_rules", titulo="Regras do Firestore/Storage",
+             regras=("C1-firestore-aberto", "C1-firestore-so-logado")),
+        dict(id="postgres_rls", titulo="RLS, policies e grants do Postgres",
+             regras=("C1-rls-desligada", "C1-policy-permissiva", "C1-grant-public")),
+        dict(id="chave_de_servico_no_cliente", titulo="Chave de serviço em código de cliente",
+             regras=("C1-service-role-no-cliente",)),
+    ], known_gaps=[
+        "autorização em backend próprio, sem RLS (não há check)",
+        "policy com predicado fraco mas não trivial — só `using (true)` é detectado",
+        "regras de Storage e de Realtime",
+        "confronto entre a rota e a tabela que ela alcança (exige fluxo, não padrão)",
+    ]),
+    "C2": dict(capability_version=1, checks=[
+        dict(id="papel_no_armazenamento_local", titulo="Papel lido de localStorage/sessionStorage",
+             regras=("C2-role-no-storage",)),
+        dict(id="guarda_visual", titulo="Permissão decidida no componente",
+             regras=("C2-guard-so-visual",)),
+    ], known_gaps=[
+        "confirmar se o endpoint correspondente revalida o papel (exige o par tela↔rota)",
+        "middleware de autorização ausente em rota nova",
+        "papel vindo de cookie ou de query string",
+    ]),
+    "C3": dict(capability_version=1, checks=[
+        dict(id="consulta_por_id_do_cliente", titulo="ORM consultando por id da requisição",
+             regras=("C3-idor-consulta-por-id",)),
+        dict(id="sql_por_id_do_cliente", titulo="SQL filtrando só por id da requisição",
+             regras=("C3-idor-sql-por-id",)),
+    ], known_gaps=[
+        "IDOR só se confirma em runtime: identidade da sessão × dado devolvido",
+        "id em rota REST sem ORM reconhecido",
+        "escopo por tenant aplicado em camada acima (não é visível por padrão)",
+    ]),
+    "C4": dict(capability_version=1, checks=[
+        dict(id="prefixo_de_chave_conhecido", titulo="Chave de API com prefixo reconhecido",
+             regras=("C4-chave-conhecida",)),
+        dict(id="chave_privada", titulo="Chave privada embutida",
+             regras=("C4-chave-privada",)),
+        dict(id="url_com_credencial", titulo="String de conexão com senha",
+             regras=("C4-url-com-senha",)),
+        dict(id="jwt_literal", titulo="JWT literal no código",
+             regras=("C4-jwt-literal",)),
+        dict(id="segredo_atribuido", titulo="Segredo atribuído a variável",
+             regras=("C4-segredo-atribuido",)),
+        dict(id="entropia", titulo="String de alta entropia em nome de segredo",
+             regras=("C4-entropia",), exts=None),
+        dict(id="permissao_do_arquivo_de_segredo", titulo="Modo do arquivo .env/.pem/.key",
+             regras=("C4-permissao-arquivo-segredo",), escopo="raiz"),
+        dict(id="arquivo_de_segredo_ilegivel", titulo="Arquivo de segredo que não pôde ser aberto",
+             regras=("C4-arquivo-ilegivel",), escopo="raiz"),
+    ], known_gaps=[
+        "histórico do Git não é varrido (gitleaks não roda no modo padrão)",
+        "prefixos de 2026 ausentes da lista: sk-ant-, sk-proj-, sbp_, hf_, whsec_, npm_, ASIA",
+        "segredo em binário, base64 ou dentro de imagem",
+        "segredo em variável de ambiente do runtime (fora do repositório)",
+    ]),
+    "C5": dict(capability_version=1, checks=[
+        dict(id="html_dinamico", titulo="HTML montado com valor dinâmico",
+             regras=("C5-innerhtml", "C5-dangerously")),
+        dict(id="execucao_dinamica", titulo="Execução dinâmica de código",
+             regras=("C5-eval",)),
+        dict(id="sql_concatenado", titulo="SQL montado por concatenação",
+             regras=("C5-sql-concatenado",)),
+        dict(id="comando_de_shell", titulo="Comando de sistema com valor dinâmico",
+             regras=("C5-comando-shell",)),
+    ], known_gaps=[
+        "taint entre arquivos: a origem do valor não é rastreada",
+        "template injection (Jinja, EJS, Handlebars)",
+        "deserialização insegura (pickle, yaml.load, unserialize)",
+        "path traversal e upload sem validação",
+        "XSS via atributo (href/src) e via framework fora de React/Vue",
+    ]),
+    "C6": dict(capability_version=1, checks=[
+        dict(id="jwt_sem_verificacao", titulo="Token decodificado sem verificar assinatura",
+             regras=("C6-jwt-sem-verificacao", "C6-alg-none")),
+        dict(id="segredo_de_assinatura_fixo", titulo="Segredo de assinatura embutido",
+             regras=("C6-jwt-segredo-fixo",)),
+        dict(id="flags_de_cookie", titulo="Cookie de sessão sem httpOnly/secure/sameSite",
+             regras=("C6-cookie-inseguro",)),
+    ], known_gaps=[
+        "as opções reais do cookie não são lidas — o check só vê a chamada",
+        "política de senha, fluxo de reset e enumeração de usuário",
+        "expiração, rotação e revogação de sessão",
+        "MFA e proteção contra força bruta",
+    ]),
+    "C7": dict(capability_version=1, checks=[
+        dict(id="cors", titulo="CORS aberto ou refletido",
+             regras=("C7-cors-aberto", "C7-cors-refletido")),
+        dict(id="redirecionamento_aberto", titulo="Redirect para destino do usuário",
+             regras=("C7-open-redirect",)),
+        dict(id="ssrf", titulo="Requisição do servidor para URL do usuário",
+             regras=("C7-ssrf",)),
+        dict(id="mutacao_por_get", titulo="Operação que altera estado exposta em GET",
+             regras=("C7-mutacao-por-get",)),
+    ], known_gaps=[
+        "token anti-CSRF: a ausência não é detectada, só a mutação por GET",
+        "cabeçalhos de segurança (CSP, HSTS, X-Frame-Options) não são verificados",
+        "CORS configurado no proxy/CDN, fora do código",
+    ]),
+    # C8 nasce vazia de propósito: não existe UMA regra de dependência
+    # vulnerável no scanner. Enquanto não houver audit rodando, a categoria sai
+    # como não verificada — nunca como "limpo".
+    "C8": dict(capability_version=1, checks=[], known_gaps=[
+        "nenhum check implementado: npm/pip/go/composer audit não é invocado",
+        "lockfile não é lido nem comparado com base de CVE",
+        "versão declarada em package.json/requirements.txt não é confrontada com nada",
+    ]),
+    "C9": dict(capability_version=1, checks=[
+        dict(id="injecao_de_prompt_em_arquivo", titulo="Texto tentando direcionar a auditoria",
+             regras=("C9-prompt-injection",)),
+    ], known_gaps=[
+        "arquivos de regra (.md, CLAUDE.md, AGENTS.md, .cursorrules, .mcp.json) estão fora "
+        "da varredura — e para arquivo de regra da raiz o achado seria registro post-mortem, "
+        "não barreira: o agente já leu o arquivo antes de a skill ativar",
+        "instrução escondida em nome de arquivo ou em mensagem de commit",
+    ]),
+}
+
+
+def _indexar_catalogo() -> dict[str, dict]:
+    """Fecha o catálogo: extensões de cada check derivadas das próprias regras,
+    e conferência de que toda regra pertence a exatamente um check.
+
+    A conferência roda na importação de propósito. Regra nova sem check é
+    exatamente o caminho por onde a cobertura volta a mentir — e falhar aqui
+    custa um traceback, não um relatório verde errado."""
+    por_regra = {r["id"]: r for r in REGRAS}
+    indice: dict[str, dict] = {}
+    vistas: set[str] = set()
+    for cat, dados in CATALOGO.items():
+        for chk in dados["checks"]:
+            chk["cat"] = cat
+            chk.setdefault("escopo", "arquivos")
+            if "exts" not in chk:
+                exts: set[str] | None = set()
+                for rid in chk["regras"]:
+                    regra = por_regra.get(rid)
+                    if regra is None:          # regra sintética (entropia, checks de raiz)
+                        continue
+                    if "ext" not in regra:
+                        exts = None
+                        break
+                    exts |= {e.lower() for e in regra["ext"]}
+                chk["exts"] = sorted(exts) if exts else None
+            for rid in chk["regras"]:
+                if rid in vistas:
+                    raise ErroDeExecucao(f"regra {rid} aparece em mais de um check do catálogo")
+                vistas.add(rid)
+                indice[rid] = chk
+    orfas = sorted({r["id"] for r in REGRAS} - vistas)
+    if orfas:
+        raise ErroDeExecucao(
+            f"regras sem check no catálogo: {orfas}. Regra sem check não entra em "
+            "cobertura nenhuma — é exatamente por aí que a categoria volta a mentir.")
+    return indice
+
+
+INDICE_REGRA_CHECK = _indexar_catalogo()
+
+RESULTADOS = ("sem_achados", "com_achados")
+COBERTURAS = ("completa", "parcial", "nenhuma", "nao_aplicavel")
+
+
+def _aplica(exts, chave: str) -> bool:
+    return exts is None or chave in exts
+
+
+def avaliar_cobertura(cobertura: dict, achados: list[dict]) -> tuple[list[dict], dict]:
+    """Os dois eixos, no nível do CHECK; a categoria é derivada.
+
+    `resultado` (o que achei) e `cobertura` (o quanto olhei) são propriedades
+    diferentes e podem ser verdadeiras ao mesmo tempo: C4 que encontrou 2
+    segredos E deixou 3 arquivos sem ler é, simultaneamente, `com_achados` e
+    `parcial`. Um campo só de três valores obrigaria a escolher qual verdade
+    contar — e a experiência diz qual das duas some.
+
+    A palavra "limpo" só existe na interseção `sem_achados` + `completa`.
+    """
+    ext_projeto = cobertura.get("ext_do_projeto", {})
+    total_projeto = sum(ext_projeto.values())
+    lidos = [chave_ext(Path(a)) for a in cobertura.get("lidos", [])]
+    nao_lidos = cobertura.get("nao_lidos", [])
+    global_ = cobertura.get("degradacao_global", [])
+
+    por_regra: dict[str, list[dict]] = {}
+    for a in achados:
+        if e_positivo(a):
+            continue
+        por_regra.setdefault(a.get("regra", ""), []).append(a)
+
+    saida: list[dict] = []
+    for cat, dados in CATALOGO.items():
+        for chk in dados["checks"]:
+            achados_do_check = [a for r in chk["regras"] for a in por_regra.get(r, [])]
+            exts = chk["exts"]
+            item = dict(id=chk["id"], cat=cat, titulo=chk["titulo"],
+                        regras=list(chk["regras"]), escopo=chk["escopo"],
+                        exts=exts, achados=len(achados_do_check),
+                        resultado="com_achados" if achados_do_check else "sem_achados")
+
+            if chk["escopo"] == "raiz":
+                item.update(cobertura="completa",
+                            motivo="verificação de raiz: enumera .env/.pem/.key e não depende "
+                                   "do orçamento de arquivos",
+                            aplicaveis=0, varridos=0, nao_lidos=0)
+                saida.append(item)
+                continue
+
+            aplicaveis = (total_projeto if exts is None
+                          else sum(n for e, n in ext_projeto.items() if e in exts))
+            varridos = sum(1 for e in lidos if _aplica(exts, e))
+            perdidos = [n for n in nao_lidos if _aplica(exts, n.get("ext", ""))]
+            item.update(aplicaveis=aplicaveis, varridos=varridos, nao_lidos=len(perdidos))
+
+            if exts is not None and aplicaveis == 0:
+                # `nao_aplicavel` SÓ com evidência, e a evidência aqui é do
+                # inventário independente (contou tudo que existe), não do
+                # filtro de relevância — senão o estado seria autorreferente.
+                item.update(cobertura="nao_aplicavel",
+                            motivo=(f"nenhum arquivo {', '.join(exts)} entre os {total_projeto} "
+                                    "arquivos de código do projeto (inventário independente)"))
+            elif varridos == 0:
+                item.update(cobertura="nenhuma",
+                            motivo=("nenhum arquivo aplicável foi lido nesta execução"
+                                    + (f" — {global_[0]}" if global_ else "")))
+            elif global_ or perdidos:
+                motivos = list(global_)
+                if perdidos:
+                    contas: dict[str, int] = {}
+                    for n in perdidos:
+                        contas[n["motivo"]] = contas.get(n["motivo"], 0) + 1
+                    motivos.append(", ".join(f"{v} {k}" for k, v in sorted(contas.items())))
+                item.update(cobertura="parcial",
+                            motivo=(f"{varridos} de {varridos + len(perdidos)} arquivos "
+                                    f"aplicáveis lidos — " + "; ".join(motivos)))
+            else:
+                item.update(cobertura="completa",
+                            motivo=f"{varridos} de {varridos} arquivos aplicáveis lidos")
+            saida.append(item)
+
+    categorias = {}
+    for cat, dados in CATALOGO.items():
+        checks = [c for c in saida if c["cat"] == cat]
+        efetivos = [c for c in checks if c["cobertura"] != "nao_aplicavel"]
+        fora = [a for a in achados
+                if a.get("categoria") == cat and not e_positivo(a)
+                and a.get("regra", "") not in INDICE_REGRA_CHECK]
+        if not checks:
+            cob, motivo = "nenhuma", ("a categoria não tem nenhum check implementado — "
+                                      "nada foi verificado aqui")
+        elif not efetivos:
+            # No nível da CATEGORIA `nao_aplicavel` não existe: "este projeto
+            # não usa Supabase" não torna autorização inaplicável, torna o
+            # detector supabase_rls inaplicável. Se todos os checks são N/A, o
+            # que se pode dizer é que a categoria não foi verificada.
+            cob, motivo = "nenhuma", ("todos os checks desta categoria são inaplicáveis a este "
+                                      "projeto — a pergunta continua sem resposta")
+        elif all(c["cobertura"] == "completa" for c in efetivos):
+            cob, motivo = "completa", f"{len(efetivos)} check(s) executados por inteiro"
+        elif any(c["cobertura"] in ("completa", "parcial") for c in efetivos):
+            cob = "parcial"
+            motivo = "; ".join(f"{c['id']}: {c['cobertura']}" for c in efetivos
+                               if c["cobertura"] != "completa")
+        else:
+            cob, motivo = "nenhuma", "nenhum check desta categoria chegou a rodar"
+        com_achado = any(c["resultado"] == "com_achados" for c in checks) or bool(fora)
+        categorias[cat] = dict(
+            resultado="com_achados" if com_achado else "sem_achados",
+            cobertura=cob, motivo=motivo,
+            capability_version=dados["capability_version"],
+            known_gaps=list(dados["known_gaps"]),
+            checks=[c["id"] for c in checks],
+            achados_fora_do_catalogo=len(fora),
+            limpo=(not com_achado) and cob == "completa")
+    return saida, categorias
+
+
+def e_limpo(cat_info: dict) -> bool:
+    """A única definição de "limpo" que este código aceita."""
+    return cat_info.get("resultado") == "sem_achados" and cat_info.get("cobertura") == "completa"
+
+
+def montar_inventario(cobertura: dict) -> dict:
+    """DOIS blocos, não um denominador só.
+
+    Jogar node_modules no total produziria "4% de cobertura" — número
+    tecnicamente correto e operacionalmente inútil, que treina o operador a
+    ignorar a métrica. O denominador principal é o código do projeto;
+    dependência e artefato aparecem contados ao lado, para que ninguém possa
+    dizer que não sabia que existem.
+
+    O grupo que importa é "tipo não reconhecido": é ali que aparece o próximo
+    furo de cobertura.
+    """
+    inv = cobertura.get("inventario", {})
+    codigo = dict(
+        analisados=cobertura.get("varridos", 0),
+        nao_reconhecidos=inv.get("nao_reconhecido", 0),
+        acima_do_limite=inv.get("acima_do_limite", 0),
+        ilegiveis=inv.get("ilegivel", 0),
+        fora_da_raiz=inv.get("fora_da_raiz", 0),
+        cortados_por_orcamento=cobertura.get("cortados", 0),
+    )
+    codigo["descobertos"] = sum(codigo.values())
+    politica = dict(
+        dependencias_e_vendor=inv.get("dependencia", 0),
+        gerados_e_cache=inv.get("gerado", 0),
+        lockfiles=inv.get("lockfile", 0),
+        binarios=inv.get("binario", 0),
+    )
+    politica["total"] = sum(politica.values())
+    return dict(codigo_do_projeto=codigo, excluidos_por_politica=politica,
+                extensoes=dict(sorted(cobertura.get("ext_do_projeto", {}).items(),
+                                      key=lambda kv: (-kv[1], kv[0]))[:25]))
 
 
 # --------------------------------------------------------------------------
@@ -1241,6 +1594,39 @@ pre{background:#0d1117;border:1px solid #30363d;border-radius:7px;padding:11px 1
 .pt-sim{font-size:11px;padding:2px 8px;border-radius:20px;background:#332b0f;border:1px solid #e3b341;color:#f0d074}
 .pt-nao{font-size:11px;padding:2px 8px;border-radius:20px;background:#21262d;border:1px solid #30363d;color:#8b949e}
 .leg-rod{font-size:12px;color:#8b949e;margin:11px 0 0}
+.eixo{font-size:11px;padding:2px 9px;border-radius:20px;border:1px solid;white-space:nowrap;display:inline-block}
+.e-limpo{background:#0f2f1c;border-color:#3fb950;color:#7ee787}
+.e-achado{background:#3a2411;border-color:#ffa657;color:#ffc08a}
+.e-nada{background:#21262d;border-color:#30363d;color:#8b949e}
+.c-completa{background:#0f2f1c;border-color:#3fb950;color:#7ee787}
+.c-parcial{background:#332b0f;border-color:#e3b341;color:#f0d074}
+.c-nenhuma{background:#3d1418;border-color:#f85149;color:#ff9f96}
+.c-na{background:#0d2d4d;border-color:#388bfd;color:#a5d6ff}
+.sec-cob{margin:26px 0 12px;font-size:14px;font-weight:600;color:#f0f6fc;border-bottom:1px solid #30363d;padding-bottom:7px}
+.sec-cob:first-child{margin-top:0}
+.inv{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.bloco-inv{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px 17px}
+.bloco-inv h3{margin:0 0 10px;font-size:13px;color:#f0f6fc;text-transform:uppercase;letter-spacing:.5px}
+.sub-inv{text-transform:none;letter-spacing:0;color:#8b949e;font-weight:400;font-size:11.5px}
+.linha-inv{display:flex;justify-content:space-between;gap:14px;padding:5px 0;border-bottom:1px solid #21262d;font-size:13px}
+.linha-inv:last-of-type{border-bottom:none}
+.linha-inv b{font-family:ui-monospace,Menlo,monospace;color:#f0f6fc}
+.linha-inv.total{border-bottom:2px solid #30363d;font-weight:600}
+.linha-inv.destaque span{color:#f0d074}.linha-inv.destaque b{color:#f0d074}
+.linha-inv.total-inv{border-top:1px solid #30363d;font-weight:600;margin-top:4px}
+.just{color:#8b949e;font-size:12px;text-align:right;max-width:60%}
+.bloco-check{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:13px 17px;margin-bottom:12px}
+.cab-check{display:flex;flex-wrap:wrap;align-items:center;gap:9px;margin-bottom:9px;font-size:14px;color:#f0f6fc}
+.ver-cap{font-size:11px;color:#8b949e;font-family:ui-monospace,Menlo,monospace}
+.sem-check{color:#ff9f96;font-size:12.5px}
+.gaps{background:transparent;border:none;padding:0;margin:9px 0 0}
+.gaps summary{font-size:12.5px;color:#8b949e;font-weight:500}
+.gaps ul{margin:8px 0 0;padding-left:20px;font-size:12.5px;color:#c9d1d9}
+.gaps li{margin-bottom:4px}
+.lim{background:#161b22;border:1px solid #30363d;border-left:3px solid #e3b341;border-radius:0 9px 9px 0;padding:11px 15px;margin-bottom:10px;font-size:13px}
+.lim b{color:#f0d074}
+.aviso-ign{border-left-color:#f85149}.aviso-ign b{color:#ff9f96}
+.amostra{margin-top:7px;font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:#8b949e;word-break:break-all}
 .conf{font-size:12.5px;color:#8b949e;border-left:2px solid #30363d;padding-left:11px}
 .nota{font-size:12px;color:#e3b341;margin-top:7px}
 .vazio{padding:34px;text-align:center;color:#8b949e;background:#161b22;border:1px solid #30363d;border-radius:10px}
@@ -1256,7 +1642,10 @@ th{color:#8b949e;font-weight:600;font-size:11.5px;text-transform:uppercase;lette
 .tit,h1{color:#000}pre{background:#f6f8fa;color:#000}
 .simples{background:#f0f6ff;color:#000}.simples b{color:#000}
 .num{background:#e6edf3;color:#000;border:1px solid #999}
-.selo{color:#000;background:#f6f8fa}.leg-n,.leg-c{color:#000}.leg-on{background:#f6f8fa}}
+.selo{color:#000;background:#f6f8fa}.leg-n,.leg-c{color:#000}.leg-on{background:#f6f8fa}
+.bloco-inv,.bloco-check,.lim{background:#fff;border-color:#ccc;break-inside:avoid}
+.bloco-inv h3,.cab-check,.linha-inv b,.sec-cob{color:#000}
+.eixo{color:#000;background:#f6f8fa}.gaps ul{color:#000}}
 """
 
 JS = """
@@ -1358,6 +1747,14 @@ def nota_de(a: dict) -> int:
     return NOTAS.get(a.get("severidade", "informativo"), NOTAS["informativo"])["nota"]
 
 
+def num(v) -> str:
+    """Milhar com ponto, do jeito que o operador lê."""
+    try:
+        return f"{int(v):,}".replace(",", ".")
+    except (TypeError, ValueError):
+        return esc(v)
+
+
 def esc(s) -> str:
     return (str(s).replace("&", "&amp;").replace("<", "&lt;")
             .replace(">", "&gt;").replace('"', "&quot;"))
@@ -1424,27 +1821,130 @@ def e_positivo(a: dict) -> bool:
     return a.get("tipo") == "positivo" or a.get("titulo", "").upper().startswith("POSITIVO")
 
 
-def render_legenda(cats_presentes: list) -> str:
-    """Tabela fixa com TODAS as categorias — a sigla sozinha não diz nada a ninguém."""
+ROTULO_COBERTURA = {
+    "completa": ("c-completa", "cobertura completa"),
+    "parcial": ("c-parcial", "cobertura parcial"),
+    "nenhuma": ("c-nenhuma", "não verificado"),
+    "nao_aplicavel": ("c-na", "não se aplica"),
+}
+
+
+def selo_resultado(info: dict) -> str:
+    if e_limpo(info):
+        return '<span class="eixo e-limpo">limpo</span>'
+    if info.get("resultado") == "com_achados":
+        return '<span class="eixo e-achado">com achado</span>'
+    return '<span class="eixo e-nada">nada encontrado</span>'
+
+
+def selo_cobertura(valor: str) -> str:
+    cls, rot = ROTULO_COBERTURA.get(valor, ROTULO_COBERTURA["nenhuma"])
+    return f'<span class="eixo {cls}">{esc(rot)}</span>'
+
+
+def render_legenda(ctx: dict) -> str:
+    """Tabela fixa com TODAS as categorias, agora em DOIS eixos.
+
+    A marca antiga era binária — "com achado" ou "limpo" — e "limpo" saía por
+    ausência de achado, inclusive para categoria que ninguém olhou e para
+    categoria que não tem uma única regra implementada. Agora "o que achei" e
+    "o quanto olhei" são colunas diferentes, e a palavra **limpo** só aparece
+    na interseção `sem_achados` + `cobertura completa`.
+    """
+    categorias = ctx.get("categorias") or {}
     linhas = []
     for c, d in CATEGORIAS.items():
-        presente = c in cats_presentes
-        marca = ('<span class="pt-sim">com achado</span>' if presente
-                 else '<span class="pt-nao">limpo</span>')
+        info = categorias.get(c, dict(resultado="sem_achados", cobertura="nenhuma"))
+        destaque = info.get("resultado") == "com_achados" or info.get("cobertura") != "completa"
         linhas.append(
-            f'<tr class="{"leg-on" if presente else ""}">'
+            f'<tr class="{"leg-on" if destaque else ""}">'
             f'<td class="leg-c">{c}</td>'
             f'<td class="leg-n">{esc(d["nome"])}</td>'
             f'<td>{esc(d["simples"])}</td>'
-            f'<td class="leg-m">{marca}</td></tr>')
+            f'<td class="leg-m">{selo_resultado(info)}</td>'
+            f'<td class="leg-m">{selo_cobertura(info.get("cobertura", "nenhuma"))}</td></tr>')
     return f"""<details class="legenda" open>
 <summary>O que significa cada categoria (C1 a C9)</summary>
 <table class="tab-leg"><thead><tr>
-<th>Sigla</th><th>Categoria</th><th>O que é, em uma frase</th><th>Nesta execução</th>
+<th>Sigla</th><th>Categoria</th><th>O que é, em uma frase</th>
+<th>O que achei</th><th>O quanto olhei</th>
 </tr></thead><tbody>{''.join(linhas)}</tbody></table>
-<p class="leg-rod">"Limpo" quer dizer que nada foi encontrado nessa categoria —
-não que ela tenha sido esgotada. A aba <b>Cobertura</b> diz o que ficou de fora da varredura.</p>
+<p class="leg-rod">São <b>duas perguntas diferentes</b>, e as duas são respondidas sempre.
+<b>"Limpo"</b> só aparece quando nada foi encontrado <b>e</b> a cobertura foi completa.
+<b>Não verificado</b> não é boa notícia: é ausência de resposta. A aba <b>Cobertura</b> diz,
+check a check, o que rodou, o que ficou de fora e por quê.</p>
 </details>"""
+
+
+def render_inventario(inv: dict) -> str:
+    """O denominador publicado — e os dois blocos separados de propósito."""
+    cod = inv.get("codigo_do_projeto", {})
+    pol = inv.get("excluidos_por_politica", {})
+    linhas_cod = [
+        ("descobertos", cod.get("descobertos", 0), "total"),
+        ("analisados", cod.get("analisados", 0), ""),
+        ("não reconhecidos", cod.get("nao_reconhecidos", 0), "destaque"),
+        ("acima do limite de tamanho", cod.get("acima_do_limite", 0), ""),
+        ("ilegíveis", cod.get("ilegiveis", 0), ""),
+        ("apontando para fora da raiz", cod.get("fora_da_raiz", 0), ""),
+        ("cortados pelo orçamento", cod.get("cortados_por_orcamento", 0), ""),
+    ]
+    linhas_pol = [
+        ("dependências / vendor", pol.get("dependencias_e_vendor", 0)),
+        ("gerados / cache / build", pol.get("gerados_e_cache", 0)),
+        ("lockfiles", pol.get("lockfiles", 0)),
+        ("binários", pol.get("binarios", 0)),
+    ]
+    html_cod = "".join(
+        f'<div class="linha-inv {cls}"><span>{esc(k)}</span><b>{num(v)}</b></div>'
+        for k, v, cls in linhas_cod)
+    html_pol = "".join(
+        f'<div class="linha-inv"><span>{esc(k)}</span><b>{num(v)}</b></div>'
+        for k, v in linhas_pol)
+    exts = inv.get("extensoes", {})
+    html_ext = ", ".join(f"{esc(k)} ({v})" for k, v in list(exts.items())[:16]) or "—"
+    return f"""<div class="inv">
+<div class="bloco-inv"><h3>Código do projeto</h3>{html_cod}
+<p class="leg-rod">O denominador que importa. <b>Não reconhecidos</b> é o número a vigiar:
+são arquivos do projeto cujo tipo o scanner não sabe ler — é ali que aparece o próximo furo.</p></div>
+<div class="bloco-inv"><h3>Excluídos por política <span class="sub-inv">(contados, não analisados)</span></h3>{html_pol}
+<div class="linha-inv total-inv"><span>total</span><b>{num(pol.get('total', 0))}</b></div>
+<p class="leg-rod">Ficam fora por decisão, não por descuido — e aparecem contados para que
+ninguém possa dizer que não sabia que existem. Somar isto ao denominador principal produziria
+uma taxa de cobertura tecnicamente correta e inútil.</p></div>
+</div>
+<p class="leg-rod">Tipos encontrados no código do projeto: {html_ext}</p>"""
+
+
+def render_checks(ctx: dict) -> str:
+    """Cobertura no nível do check — a categoria é derivada daqui."""
+    checks = ctx.get("checks") or []
+    categorias = ctx.get("categorias") or {}
+    if not checks and not categorias:
+        return ""
+    blocos = []
+    for c, cat_info in categorias.items():
+        nome = CATEGORIAS.get(c, {}).get("nome", "")
+        meus = [k for k in checks if k["cat"] == c]
+        linhas = "".join(
+            f'<tr><td class="leg-c">{esc(k["id"])}</td>'
+            f'<td class="leg-n">{esc(k["titulo"])}</td>'
+            f'<td class="leg-m">{"com achado (" + str(k["achados"]) + ")" if k["achados"] else "nada encontrado"}</td>'
+            f'<td class="leg-m">{selo_cobertura(k["cobertura"])}</td>'
+            f'<td>{esc(k.get("motivo", ""))}</td></tr>'
+            for k in meus)
+        if not meus:
+            linhas = ('<tr><td colspan="5" class="sem-check">Nenhum check implementado nesta '
+                      'categoria. Ela não pode aparecer como limpa — não foi verificada.</td></tr>')
+        gaps = "".join(f"<li>{esc(g)}</li>" for g in cat_info.get("known_gaps", []))
+        blocos.append(f"""<div class="bloco-check">
+<div class="cab-check"><b>{c} · {esc(nome)}</b>
+{selo_resultado(cat_info)} {selo_cobertura(cat_info.get("cobertura", "nenhuma"))}
+<span class="ver-cap">catálogo v{cat_info.get("capability_version", 1)}</span></div>
+<table class="tab-leg"><tbody>{linhas}</tbody></table>
+<details class="gaps"><summary>Lacunas declaradas desta categoria ({len(cat_info.get("known_gaps", []))})</summary>
+<ul>{gaps}</ul></details></div>""")
+    return "".join(blocos)
 
 
 def render_html(ctx: dict) -> str:
@@ -1525,21 +2025,79 @@ confirmar. Os itens da aba "Verificado e OK" não entram nesta contagem.</p>
             + "".join(render_item(a) for a in positivos) + "</div>")
 
     cob = ctx["cobertura"]
+    cats_info = ctx.get("categorias") or {}
+    n_completa = sum(1 for d in cats_info.values() if d.get("cobertura") == "completa")
+    n_limpa = sum(1 for d in cats_info.values() if e_limpo(d))
     linhas_cob = [
         ("Modo executado", ctx["modo"]),
         ("Stacks detectadas", ", ".join(ctx["recon"]["stacks"]) or "nenhuma reconhecida"),
         ("Referências consultadas", ", ".join(ctx["recon"]["referencias"])),
-        ("Arquivos encontrados", cob["total_encontrados"]),
-        ("Arquivos varridos", cob["varridos"]),
-        ("Arquivos fora da varredura", cob["cortados"]),
+        ("Categorias com cobertura completa", f"{n_completa} de {len(CATEGORIAS)}"),
+        ("Categorias limpas (nada achado E cobertura completa)", f"{n_limpa} de {len(CATEGORIAS)}"),
+        ("Relatório gravado em", ctx.get("saida", "")),
+        ("Estado do auditor", ctx.get("estado_dir", "")),
+        ("Escrita dentro do repositório auditado", "nenhuma"),
     ]
     if cob.get("motivo_corte"):
         linhas_cob.append(("Motivo do corte", cob["motivo_corte"]))
-    for lim in ctx.get("limitacoes", []):
-        linhas_cob.append(("Não avaliado", lim))
     tabela_cob = "".join(f"<tr><th>{esc(k)}</th><td>{esc(v)}</td></tr>" for k, v in linhas_cob)
+
+    lims = ctx.get("limitacoes", []) or []
+    if lims:
+        itens_lim = []
+        for lim in lims:
+            if isinstance(lim, dict):
+                amostra = lim.get("itens") or []
+                extra = (f'<div class="amostra">{esc(", ".join(map(str, amostra[:12])))}'
+                         f'{" …" if len(amostra) > 12 else ""}</div>' if amostra else "")
+                itens_lim.append(f'<div class="lim"><b>{esc(lim.get("tipo", "limitação"))}</b> — '
+                                 f'{esc(lim.get("descricao", ""))}{extra}</div>')
+            else:
+                itens_lim.append(f'<div class="lim">{esc(lim)}</div>')
+        bloco_lim = ('<div class="sec-cob">O que esta execução NÃO fez</div>'
+                     + "".join(itens_lim))
+    else:
+        bloco_lim = ('<div class="sec-cob">O que esta execução NÃO fez</div>'
+                     '<div class="lim">Nenhuma limitação registrada além das lacunas de '
+                     'catálogo listadas por categoria.</div>')
+
+    ign = ctx.get("ignore_do_alvo") or {}
+    if ign.get("existe"):
+        pedidos = "".join(
+            f'<div class="linha-inv"><span>fp {esc(q.get("fingerprint", ""))}</span>'
+            f'<span class="just">{esc(q.get("justificativa", ""))}</span></div>'
+            for q in ign.get("pedidos", [])[:40])
+        bloco_ign = f"""<div class="sec-cob">O que o repositório pediu para ignorar</div>
+<div class="lim aviso-ign"><b>O repositório auditado traz um <code>.ll-sec-ignore</code> pedindo
+para ignorar {len(ign.get('pedidos', []))} achado(s). O pedido NÃO foi aplicado.</b>
+Conteúdo do alvo é dado sob análise, nunca instrução: deixar o auditado escolher o que a
+auditoria cala é entregar o silêncio a quem está sendo auditado. Para aceitar um risco de
+verdade, o registro vai em <code>supressoes.json</code>, no estado do auditor.
+{pedidos}</div>"""
+    else:
+        bloco_ign = ""
+
+    reset = ctx.get("reset_de_identidade") or ""
+    bloco_reset = (f'<div class="lim aviso-ign"><b>Linha de base reiniciada.</b> {esc(reset)}</div>'
+                   if reset else "")
+
     tabs.append('<div class="tab" data-alvo="p-cob">Cobertura</div>')
-    paineis.append(f'<div class="painel" id="p-cob"><table>{tabela_cob}</table></div>')
+    paineis.append(
+        '<div class="painel" id="p-cob">'
+        + bloco_reset
+        + '<div class="sec-cob">Inventário do repositório</div>'
+        + render_inventario(ctx.get("inventario") or montar_inventario(cob))
+        + '<div class="sec-cob">Resumo da execução</div>'
+        + f'<table>{tabela_cob}</table>'
+        + '<div class="sec-cob">Cobertura check a check</div>'
+        + '<p class="leg-rod">A cobertura da categoria é <b>derivada</b> dos checks — nunca '
+          'declarada direto. E "completa" quer dizer <b>execução completa da capacidade '
+          'declarada</b>, nunca "provamos que não existe falha": as lacunas conhecidas de cada '
+          'categoria estão listadas junto, porque lacuna implícita é como categoria vazia '
+          'consegue parecer limpa.</p>'
+        + render_checks(ctx)
+        + bloco_lim + bloco_ign
+        + "</div>")
 
     if suprimidos:
         itens_sup = "".join(
@@ -1571,7 +2129,7 @@ dentro do projeto.</div>
 <div class="meta">{uso_txt}</div>
 {bloco_diff}
 <div class="placar">{placar}</div>
-{legenda_notas}\n{render_legenda(cats_presentes)}
+{legenda_notas}\n{render_legenda(ctx)}
 <div class="tabs">{''.join(tabs)}</div>
 {''.join(paineis)}
 <div class="rodape">
@@ -1663,6 +2221,11 @@ def cmd_scan(args):
             tipo="reset_de_identidade", descricao=estado["motivo_reset"],
             afeta="diff", itens=[]))
 
+    # Os dois eixos são calculados AQUI, sobre a lista bruta, e recalculados no
+    # render sobre a lista final: `cobertura` é fato de execução (não muda com a
+    # triagem), `resultado` é a lista que o operador de fato vai ver.
+    checks, categorias = avaliar_cobertura(cobertura, restantes + suprimidos)
+
     payload = dict(
         projeto=root.name, root=str(root), modo=args.mode,
         gerado_em=datetime.now().strftime("%d/%m/%Y %H:%M"),
@@ -1671,7 +2234,8 @@ def cmd_scan(args):
         limitacoes=cobertura["limitacoes"], uso={}, estado_anterior=anteriores,
         ignore_do_alvo=ignore_do_alvo, estado_dir=str(estado["dir"]),
         identidade=estado["identidade"], reset_de_identidade=estado["motivo_reset"],
-        saida=str(out),
+        saida=str(out), checks=checks, categorias=categorias,
+        inventario=montar_inventario(cobertura),
     )
     destino = out / "findings.json"
     escrever_estado(destino, json.dumps(payload, ensure_ascii=False, indent=2))
@@ -1683,7 +2247,12 @@ def cmd_scan(args):
     resumo = {s: len([a for a in restantes if a["severidade"] == s]) for s in SEVS}
     print(json.dumps({"findings_json": str(destino), "total": len(restantes),
                       "por_severidade": resumo, "suprimidos": len(suprimidos),
-                      "diff": diff, "recon": recon, "cobertura": cobertura,
+                      "diff": diff, "recon": recon,
+                      "inventario": payload["inventario"],
+                      "categorias": {c: {k: v for k, v in d.items()
+                                         if k in ("resultado", "cobertura", "limpo")}
+                                     for c, d in categorias.items()},
+                      "limitacoes": [l["descricao"] for l in cobertura["limitacoes"]],
                       "estado_dir": str(estado["dir"]),
                       "ignore_do_alvo": ignore_do_alvo,
                       "escrita_no_alvo": "nenhuma"}, ensure_ascii=False, indent=2))
@@ -1731,6 +2300,14 @@ def cmd_render(args):
             "fingerprints_resolvidos": resolvidos,
         }
 
+    # O eixo `resultado` é recalculado sobre a lista FINAL (o agente rebaixou,
+    # descartou e acrescentou achados); o eixo `cobertura` não se recalcula
+    # aqui, porque é fato da execução do scan e triagem não muda o que foi lido.
+    cob_scan = dados.get("cobertura", {}) or {}
+    checks, categorias = avaliar_cobertura(cob_scan, dados["achados"] + dados.get("suprimidos", []))
+    dados["checks"], dados["categorias"] = checks, categorias
+    dados.setdefault("inventario", montar_inventario(cob_scan))
+
     modo_label = {"completa": "completo", "rapida": "rapido"}.get(
         dados.get("modo", ""), dados.get("modo", "") or "run")
     proj = re.sub(r"[^A-Za-z0-9_-]+", "-", dados.get("projeto", "projeto")).strip("-") or "projeto"
@@ -1764,6 +2341,9 @@ def cmd_render(args):
         ensure_ascii=False, indent=2))
     print(json.dumps({"html": str(destino), "achados": len(dados["achados"]),
                       "estado_dir": str(estado["dir"]),
+                      "categorias": {c: {k: v for k, v in d.items()
+                                         if k in ("resultado", "cobertura", "limpo")}
+                                     for c, d in categorias.items()},
                       "escrita_no_alvo": "nenhuma"}, ensure_ascii=False, indent=2))
 
 
@@ -1784,8 +2364,6 @@ def main():
     p.add_argument("--out", default=None, help=ajuda_out)
     p.add_argument("--repo-id", dest="repo_id", default=None, help=ajuda_id)
     p.add_argument("--since", default=None, help="commit de referência para o modo diff")
-    p.add_argument("--exit-zero", dest="exit_zero", action="store_true",
-                   help="sempre sair com 0, mesmo com achado bloqueante ou cobertura parcial")
     p.set_defaults(f=cmd_scan)
 
     p = sub.add_parser("render")
@@ -1794,8 +2372,6 @@ def main():
     p.add_argument("--repo-id", dest="repo_id", default=None, help=ajuda_id)
     p.add_argument("--findings", required=True)
     p.add_argument("--uso", default=None, help="JSON do session_usage.py")
-    p.add_argument("--exit-zero", dest="exit_zero", action="store_true",
-                   help="sempre sair com 0, mesmo com achado bloqueante ou cobertura parcial")
     p.set_defaults(f=cmd_render)
 
     args = ap.parse_args()
