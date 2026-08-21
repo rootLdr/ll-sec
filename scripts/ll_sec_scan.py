@@ -346,6 +346,13 @@ REGRAS = [
     dict(id="C4-segredo-atribuido", cat="C4", sev="alto",
          titulo="Segredo atribuído diretamente a variável",
          rx=R(r"(?:const|let|var|final|val)?\s*\b\w*(secret|password|passwd|senha|api_?key|apikey|token|auth)\w*\s*[:=]\s*['\"][^'\"\s]{12,}['\"]"),
+         # `.env`, docker-compose, YAML de CI, manifesto k8s e `export VAR=valor`
+         # NÃO usam aspas — e são exatamente onde segredo mora. Exigir aspas
+         # fazia o mesmo valor sair ALTO num .ts e ZERO num .env.
+         # `[ \t]` e não `\s` em toda a regra: sem aspas delimitando o valor,
+         # um `\s*` atravessa a quebra de linha e casa o NOME de uma linha com o
+         # VALOR da seguinte — achado com número de linha errado.
+         rx_sem_aspas=R(r"(?:export[ \t]+|const|let|var|final|val)?[ \t]*\b\w*(secret|password|passwd|senha|api_?key|apikey|token|auth)\w*[ \t]*[:=][ \t]*['\"]?([^'\"\s]{12,})['\"]?"),
          mascarar=True,
          ignora_valor=R(r"^(process\.env|import\.meta|os\.environ|env\.|<|\{\{|\$\{|xxx|todo|change|your|exemplo|example|placeholder|dummy|fake|test|redacted|\*+)"),
          explica="Valor fixo em variável com nome de segredo. Mesmo que hoje seja de teste, "
@@ -481,6 +488,24 @@ RX_ATRIBUICAO = re.compile(
     re.IGNORECASE,
 )
 
+# Mesma regra com as aspas OPCIONAIS, para os formatos em que segredo não é
+# escrito entre aspas. A entropia é a rede de segurança do C4; enquanto ela
+# exigia aspas, ela caía junto com a regra de padrão nos mesmos arquivos.
+RX_ATRIBUICAO_SEM_ASPAS = re.compile(
+    r"\b(\w*(?:key|secret|token|password|senha|api|auth|cred)\w*)[ \t]*[:=][ \t]*['\"]?([^'\"\s]{20,})['\"]?",
+    re.IGNORECASE,
+)
+
+# Extensões em que o valor costuma vir sem aspas.
+EXT_SEM_ASPAS = {".yml", ".yaml", ".sh", ".tf", ".env", ".tfvars", ".properties", ".ini", ".conf"}
+
+
+def valor_sem_aspas(p: Path) -> bool:
+    """O arquivo é de um formato em que segredo é escrito sem aspas?"""
+    return (p.suffix.lower() in EXT_SEM_ASPAS
+            or p.name in ARQ_SEM_EXT
+            or p.name.startswith(".env"))
+
 
 def entropia_shannon(s: str) -> float:
     if not s:
@@ -527,6 +552,7 @@ def varrer(root: Path, arquivos: list[Path], stacks: list[str]) -> list[dict]:
         rel = str(p.relative_to(root)) if p.is_relative_to(root) else str(p)
         linhas = texto.splitlines()
         eh_teste = bool(re.search(r"(test|spec|fixture|mock|__tests__|example)", rel, re.I))
+        sem_aspas = valor_sem_aspas(p)
 
         for regra in REGRAS:
             if "ext" in regra and p.suffix.lower() not in regra["ext"]:
@@ -536,7 +562,8 @@ def varrer(root: Path, arquivos: list[Path], stacks: list[str]) -> list[dict]:
             if "caminho_nao" in regra and regra["caminho_nao"].search(rel):
                 continue
 
-            for m in regra["rx"].finditer(texto):
+            rx = regra["rx_sem_aspas"] if (sem_aspas and "rx_sem_aspas" in regra) else regra["rx"]
+            for m in rx.finditer(texto):
                 linha_n = texto.count("\n", 0, m.start()) + 1
                 trecho = linhas[linha_n - 1].strip() if linha_n <= len(linhas) else m.group(0)
 
@@ -568,7 +595,7 @@ def varrer(root: Path, arquivos: list[Path], stacks: list[str]) -> list[dict]:
                 ))
 
         # entropia — só informativo, para não inflar falso positivo
-        for m in RX_ATRIBUICAO.finditer(texto):
+        for m in (RX_ATRIBUICAO_SEM_ASPAS if sem_aspas else RX_ATRIBUICAO).finditer(texto):
             nome, valor = m.group(1), m.group(2)
             if re.match(r"^(process\.env|import\.meta|os\.environ|https?://|\$\{|\{\{|<)", valor):
                 continue
