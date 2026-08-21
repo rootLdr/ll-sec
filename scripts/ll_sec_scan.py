@@ -49,6 +49,38 @@ EXT_CODIGO = {
 
 ARQ_SEM_EXT = {"Dockerfile", "Procfile", "Makefile", ".env", ".npmrc"}
 
+LOCKFILES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "composer.lock",
+             "Gemfile.lock", "poetry.lock", "Cargo.lock", "go.sum", "Pipfile.lock",
+             "bun.lockb", "pdm.lock", "uv.lock"}
+
+# Não é lista de "o que ignorar": é lista de "o que contar como binário no
+# inventário". A diferença importa — o inventário publica o denominador, e
+# arquivo que ninguém conta é arquivo que ninguém sabe que existe.
+EXT_BINARIA = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico", ".bmp", ".tiff",
+    ".pdf", ".zip", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".war",
+    ".so", ".dll", ".dylib", ".exe", ".bin", ".o", ".a", ".class", ".pyc", ".pyd",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".mov", ".avi",
+    ".wav", ".ogg", ".webm", ".psd", ".ai", ".sketch", ".db", ".sqlite", ".sqlite3",
+    ".wasm", ".node", ".pack", ".idx", ".DS_Store",
+}
+
+# Diretórios excluídos por política, separados pelo MOTIVO da exclusão: o
+# relatório mostra "dependência" e "gerado" em linhas diferentes porque somar
+# os dois num total só produz aquele "4% de cobertura" que é tecnicamente
+# correto e operacionalmente inútil.
+DIRS_DEPENDENCIA = {"node_modules", "vendor", ".venv", "venv", "Pods", ".terraform",
+                    "bower_components", "site-packages"}
+DIRS_GERADO = {"dist", "build", ".next", "out", "coverage", ".turbo", ".cache",
+               "target", "bin", "obj", ".gradle", "__pycache__", ".pytest_cache",
+               ".svelte-kit", ".agent-browser", "ll-sec-relatorios"}
+
+
+class ErroDeExecucao(Exception):
+    """Falha que invalida a auditoria inteira. Sai como erro (exit 1), NUNCA
+    como relatório: relatório vazio é lido como aprovação, que é o defeito que
+    este lote existe para fechar."""
+
 MARCADORES_STACK = [
     ("nextjs",      ["next.config.js", "next.config.ts", "next.config.mjs"]),
     ("node-express",["package.json"]),
@@ -130,10 +162,15 @@ def listar_arquivos(root: Path, mode: str, since: str | None) -> tuple[list[Path
                 capture_output=True, text=True, timeout=30, check=True,
             ).stdout
             alvos = [root / l.strip() for l in saida.splitlines() if l.strip()]
-            arquivos = [p for p in alvos if p.is_file() and relevante(p)]
+            arquivos = [p for p in alvos if p.is_file() and relevante(p, root)]
             cobertura["total_encontrados"] = len(arquivos)
             cobertura["varridos"] = len(arquivos)
             cobertura["ref_diff"] = ref
+            cobertura["limitacoes"].append(dict(
+                tipo="modo_diff",
+                descricao=(f"modo diff: só os {len(arquivos)} arquivos alterados desde `{ref}` "
+                           f"foram varridos. O resto do repositório não foi olhado nesta execução."),
+                afeta="todos", itens=[]))
             return arquivos, cobertura
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
                 FileNotFoundError, OSError) as e:
@@ -145,50 +182,222 @@ def listar_arquivos(root: Path, mode: str, since: str | None) -> tuple[list[Path
                 tipo="modo_diff_indisponivel", descricao=motivo, afeta="todos", itens=[]))
             mode = "rapida"
 
-    encontrados: list[Path] = []
+    inv: dict[str, list[Path]] = {k: [] for k in (
+        "analisar", "nao_reconhecido", "acima_do_limite", "ilegivel", "fora_da_raiz")}
+    politica: dict[str, int] = {"dependencia": 0, "gerado": 0, "lockfile": 0, "binario": 0}
+
+    # Inventário independente: conta o que EXISTE, sem passar pelo filtro de
+    # relevância. Sem isso, "cobertura completa" quer dizer "completa segundo o
+    # meu próprio filtro" — a definição circular que deixou .github/, .md e
+    # .toml de fora por meses sem ninguém perceber. Contar não é ler: dentro de
+    # node_modules o walk só soma len(filenames), sem construir caminho nem
+    # abrir arquivo.
     for dirpath, dirnames, filenames in os.walk(root):
         # `d != ".git"`, e não `startswith(".git")`: o prefixo comia `.github/` e
         # `.gitlab/` junto com o `.git/`, e workflow de CI é dos lugares mais
-        # comuns para segredo em texto claro. Só o diretório do Git sai.
-        dirnames[:] = [d for d in dirnames if d not in IGNORAR_DIRS and d != ".git"]
+        # comuns para segredo em texto claro. Só o diretório do Git sai — e ele
+        # sai inteiro, sem ser inventariado, porque contar objeto de Git não diz
+        # nada a ninguém.
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        balde = balde_do_diretorio(Path(dirpath), root)
+        if balde:
+            politica[balde] += len(filenames)
+            continue
         for fn in filenames:
             p = Path(dirpath) / fn
-            if relevante(p):
-                encontrados.append(p)
+            c = classificar(p, root)
+            if c in politica:
+                politica[c] += 1
+            else:
+                inv[c].append(p)
 
+    encontrados = inv["analisar"]
     cobertura["total_encontrados"] = len(encontrados)
+    cobertura["inventario"] = {k: len(v) for k, v in inv.items()}
+    cobertura["inventario"].update(politica)
+    cobertura["ext_do_projeto"] = contar_extensoes(
+        inv["analisar"] + inv["nao_reconhecido"] + inv["acima_do_limite"]
+        + inv["ilegivel"] + inv["fora_da_raiz"], root)
+
+    if not encontrados and not any(inv[k] for k in
+                                   ("nao_reconhecido", "acima_do_limite", "ilegivel")):
+        # Zero arquivo de código encontrado quase nunca é "projeto limpo": é
+        # raiz errada, filtro quebrado ou repositório que não é o que se pensa.
+        # Sai como erro, não como relatório verde.
+        raise ErroDeExecucao(
+            f"nenhum arquivo de código foi encontrado sob {root} "
+            f"(inventário: {cobertura['inventario']}). "
+            "A raiz está errada, ou tudo ali é dependência/gerado/binário. "
+            "Nenhum relatório foi emitido — auditoria sem arquivo não é auditoria limpa.")
+
+    if inv["fora_da_raiz"]:
+        cobertura["limitacoes"].append(dict(
+            tipo="fora_da_raiz",
+            descricao=("arquivo apontando para fora da raiz auditada (symlink) — recusado sem ser "
+                       "lido, para o conteúdo de fora do repositório não entrar no relatório"),
+            afeta="todos",
+            itens=[rel_de(p, root) for p in inv["fora_da_raiz"][:40]]))
+    if inv["acima_do_limite"]:
+        cobertura["limitacoes"].append(dict(
+            tipo="acima_do_limite",
+            descricao="arquivo de código acima de 800 KB — não foi lido nesta execução",
+            afeta="arquivos",
+            itens=[rel_de(p, root) for p in inv["acima_do_limite"][:40]]))
+    if inv["ilegivel"]:
+        cobertura["limitacoes"].append(dict(
+            tipo="ilegivel",
+            descricao="arquivo de código que o auditor não conseguiu abrir (permissão ou erro de E/S)",
+            afeta="arquivos",
+            itens=[rel_de(p, root) for p in inv["ilegivel"][:40]]))
+    if inv["nao_reconhecido"]:
+        cobertura["limitacoes"].append(dict(
+            tipo="nao_reconhecido",
+            descricao=(f"{len(inv['nao_reconhecido'])} arquivos do projeto têm tipo que o scanner "
+                       "não sabe ler e ficaram fora da varredura — este é o número que mostra "
+                       "onde está o próximo furo de cobertura"),
+            afeta="arquivos",
+            itens=[rel_de(p, root) for p in inv["nao_reconhecido"][:40]]))
+
     encontrados.sort(key=lambda p: (prioridade(p, root), str(p)))
 
     teto = 1200 if mode == "completa" else 600
     if len(encontrados) > teto:
-        cobertura["cortados"] = len(encontrados) - teto
+        cortados = encontrados[teto:]
+        cobertura["cortados"] = len(cortados)
         cobertura["motivo_corte"] = (
             f"repositório grande: varridos os {teto} arquivos de maior prioridade "
             f"(rotas/API → auth → banco/migrations → render de input → resto); "
-            f"{len(encontrados) - teto} arquivos de menor prioridade ficaram de fora"
+            f"{len(cortados)} arquivos de menor prioridade ficaram de fora"
         )
+        cobertura["limitacoes"].append(dict(
+            tipo="orcamento",
+            descricao=cobertura["motivo_corte"],
+            afeta="arquivos",
+            itens=[rel_de(p, root) for p in cortados[:40]]))
+        cobertura["ext_cortadas"] = contar_extensoes(cortados, root)
         encontrados = encontrados[:teto]
 
     cobertura["varridos"] = len(encontrados)
     return encontrados, cobertura
 
 
-def relevante(p: Path) -> bool:
-    if any(parte in IGNORAR_DIRS for parte in p.parts):
-        return False
-    if p.name in {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "composer.lock",
-                  "Gemfile.lock", "poetry.lock", "Cargo.lock"}:
-        return False
-    if p.name in ARQ_SEM_EXT or p.name.startswith(".env"):
+def absorver_diagnostico(cobertura: dict, diag: dict) -> None:
+    """O que a varredura descobriu na hora de LER (arquivo que não abriu, link
+    para fora) entra na cobertura junto com o que a listagem já sabia."""
+    cobertura["lidos"] = diag["lidos"]
+    for chave, tipo, texto in (
+        ("ilegiveis", "ilegivel",
+         "arquivo elegível que não pôde ser lido na varredura (permissão ou erro de E/S)"),
+        ("fora_da_raiz", "fora_da_raiz",
+         "arquivo apontando para fora da raiz auditada — recusado sem ser lido"),
+    ):
+        if not diag[chave]:
+            continue
+        cobertura["inventario"][tipo if tipo != "ilegivel" else "ilegivel"] = (
+            cobertura["inventario"].get(tipo, 0) + len(diag[chave]))
+        cobertura["limitacoes"].append(dict(
+            tipo=tipo, descricao=texto, afeta="arquivos", itens=diag[chave][:40]))
+        cobertura["varridos"] = max(0, cobertura.get("varridos", 0) - len(diag[chave]))
+
+
+def balde_do_diretorio(dirpath: Path, root: Path) -> str | None:
+    """Este diretório inteiro é exclusão de política? Devolve o balde do
+    inventário ou None quando o diretório é código do projeto."""
+    try:
+        partes = dirpath.relative_to(root).parts
+    except ValueError:
+        return "gerado"
+    for parte in partes:
+        if parte in DIRS_DEPENDENCIA:
+            return "dependencia"
+        if parte in DIRS_GERADO or parte in IGNORAR_DIRS:
+            return "gerado"
+    return None
+
+
+def rel_de(p: Path, root: Path) -> str:
+    try:
+        return str(p.relative_to(root))
+    except ValueError:
+        return str(p)
+
+
+def chave_ext(p: Path) -> str:
+    """A chave que decide se um check se aplica a um arquivo: a extensão, ou o
+    próprio nome quando o arquivo não tem extensão (.env, Dockerfile)."""
+    return p.suffix.lower() or p.name
+
+
+def contar_extensoes(arquivos: list[Path], root: Path) -> dict[str, int]:
+    contagem: dict[str, int] = {}
+    for p in arquivos:
+        k = chave_ext(p)
+        contagem[k] = contagem.get(k, 0) + 1
+    return contagem
+
+
+def dentro_da_raiz(p: Path, root: Path) -> bool:
+    """O arquivo, DEPOIS de resolver links, continua sob a raiz auditada?
+
+    Um `config.txt -> ~/.ssh/id_rsa` dentro do repositório auditado não é um
+    buraco de cobertura: é exfiltração da máquina que audita, com o conteúdo
+    saindo dentro do relatório. Só symlink paga o custo do resolve() — o walk
+    não desce por link de diretório."""
+    if not p.is_symlink():
         return True
-    if p.suffix.lower() not in EXT_CODIGO:
+    try:
+        return p.resolve().is_relative_to(root)
+    except (OSError, RuntimeError):
         return False
+
+
+def classificar(p: Path, root: Path) -> str:
+    """Por que este arquivo entra, ou não entra, na varredura.
+
+    Devolve o motivo em vez de um booleano porque o inventário (0.1) publica o
+    denominador: cada arquivo que fica de fora precisa aparecer contado, com o
+    motivo ao lado. "Não varri" sem número é a mesma coisa que silêncio.
+    """
+    try:
+        # relative_to(root), NÃO p.parts: testar o caminho absoluto fazia os
+        # ancestrais ACIMA da raiz entrarem no teste, e um repositório que
+        # morasse sob uma pasta chamada build/, bin/ ou out/ varria ZERO
+        # arquivo e saía com as nove categorias "limpas".
+        partes = p.relative_to(root).parts
+    except ValueError:
+        return "fora_da_raiz"
+
+    for parte in partes[:-1]:
+        if parte in DIRS_DEPENDENCIA:
+            return "dependencia"
+        if parte in DIRS_GERADO or parte == ".git":
+            return "gerado"
+        if parte in IGNORAR_DIRS:
+            return "gerado"
+    if p.name in LOCKFILES:
+        return "lockfile"
+    if not dentro_da_raiz(p, root):
+        return "fora_da_raiz"
+
+    if p.name in ARQ_SEM_EXT or p.name.startswith(".env"):
+        pass
+    elif p.suffix.lower() in EXT_CODIGO:
+        pass
+    elif p.suffix.lower() in EXT_BINARIA:
+        return "binario"
+    else:
+        return "nao_reconhecido"
+
     try:
         if p.stat().st_size > 800_000:
-            return False
+            return "acima_do_limite"
     except OSError:
-        return False
-    return True
+        return "ilegivel"
+    return "analisar"
+
+
+def relevante(p: Path, root: Path) -> bool:
+    return classificar(p, root) == "analisar"
 
 
 def prioridade(p: Path, root: Path) -> int:
@@ -540,16 +749,30 @@ def fingerprint(regra_id: str, rel: str, trecho: str) -> str:
     return hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
 
 
-def varrer(root: Path, arquivos: list[Path], stacks: list[str]) -> list[dict]:
+def varrer(root: Path, arquivos: list[Path], stacks: list[str]) -> tuple[list[dict], dict]:
+    """Varre e devolve (achados, diagnóstico).
+
+    O diagnóstico não é log: é o que sustenta o eixo de cobertura. Arquivo que
+    o scanner não conseguiu ler precisa aparecer contado — sumir em silêncio é
+    o que fazia "categoria limpa" significar "ninguém olhou"."""
     achados: list[dict] = []
     vistos: set[str] = set()
+    diag: dict[str, list[str]] = {"lidos": [], "ilegiveis": [], "fora_da_raiz": []}
 
     for p in arquivos:
+        # Guarda redundante de propósito: a lista já vem filtrada, mas ler
+        # arquivo de fora da raiz é exfiltração, não bug de cobertura — e o
+        # custo de conferir de novo é um lstat.
+        if not dentro_da_raiz(p, root):
+            diag["fora_da_raiz"].append(rel_de(p, root))
+            continue
         try:
             texto = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
+            diag["ilegiveis"].append(rel_de(p, root))
             continue
         rel = str(p.relative_to(root)) if p.is_relative_to(root) else str(p)
+        diag["lidos"].append(rel)
         linhas = texto.splitlines()
         eh_teste = bool(re.search(r"(test|spec|fixture|mock|__tests__|example)", rel, re.I))
         sem_aspas = valor_sem_aspas(p)
@@ -624,7 +847,7 @@ def varrer(root: Path, arquivos: list[Path], stacks: list[str]) -> list[dict]:
 
     ordem = {"critico": 0, "alto": 1, "medio": 2, "baixo": 3, "informativo": 4}
     achados.sort(key=lambda a: (ordem[a["severidade"]], a["categoria"], a["arquivo"]))
-    return achados
+    return achados, diag
 
 
 def checar_arquivos_ilegiveis(root: Path) -> list[dict]:
@@ -641,6 +864,8 @@ def checar_arquivos_ilegiveis(root: Path) -> list[dict]:
         nome = p.name
         if not p.is_file() or any(nome.endswith(suf) for suf in
                                   (".example", ".sample", ".template", ".dist")):
+            continue
+        if not dentro_da_raiz(p, root):
             continue
         try:
             with p.open("r", encoding="utf-8", errors="replace") as fh:
@@ -687,6 +912,8 @@ def checar_permissao_arquivos_de_segredo(root: Path) -> list[dict]:
         if not p.is_file():
             continue
         if any(nome.endswith(suf) for suf in (".example", ".sample", ".template", ".dist")):
+            continue
+        if not dentro_da_raiz(p, root):
             continue
         try:
             modo = p.stat().st_mode & 0o777
@@ -1209,7 +1436,8 @@ def cmd_scan(args):
 
     recon = detectar_stacks(root)
     arquivos, cobertura = listar_arquivos(root, args.mode, args.since)
-    achados = varrer(root, arquivos, recon["stacks"])
+    achados, diag = varrer(root, arquivos, recon["stacks"])
+    absorver_diagnostico(cobertura, diag)
 
     sup = carregar_supressoes(root)
     suprimidos = []
@@ -1363,7 +1591,11 @@ def main():
     p.set_defaults(f=cmd_render)
 
     args = ap.parse_args()
-    args.f(args)
+    try:
+        return args.f(args) or 0
+    except ErroDeExecucao as e:
+        print(f"ll-sec: ERRO — {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
