@@ -1,0 +1,7 @@
+# Artefatos locais do Python — nunca versionar.
+__pycache__/
+*.pyc
+
+# Saída local de execução (o relatório é mapa de vulnerabilidade).
+ll-sec-relatorios/
+*.local.json
