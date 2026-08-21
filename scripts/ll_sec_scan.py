@@ -114,22 +114,35 @@ def detectar_stacks(root: Path) -> dict:
 
 def listar_arquivos(root: Path, mode: str, since: str | None) -> tuple[list[Path], dict]:
     """Arquivos de código a varrer, já priorizados e com teto por modo."""
-    cobertura = {"total_encontrados": 0, "varridos": 0, "cortados": 0, "motivo_corte": ""}
+    cobertura = {"total_encontrados": 0, "varridos": 0, "cortados": 0, "motivo_corte": "",
+                 "limitacoes": []}
 
     if mode == "diff":
         ref = since or "HEAD~1"
         try:
+            # `check=True` de propósito: fora de um repositório Git o `git diff`
+            # sai com 128 e stdout vazio. Sem isso, a lista vazia virava
+            # "nenhum arquivo mudou" e a auditoria devolvia zero achado em
+            # silêncio — o pior caminho de F1. O except abaixo, que sempre
+            # existiu, era inalcançável justamente por causa disso.
             saida = subprocess.run(
                 ["git", "-C", str(root), "diff", "--name-only", ref],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, timeout=30, check=True,
             ).stdout
             alvos = [root / l.strip() for l in saida.splitlines() if l.strip()]
             arquivos = [p for p in alvos if p.is_file() and relevante(p)]
             cobertura["total_encontrados"] = len(arquivos)
             cobertura["varridos"] = len(arquivos)
+            cobertura["ref_diff"] = ref
             return arquivos, cobertura
-        except Exception as e:
-            cobertura["motivo_corte"] = f"git diff falhou ({e}); caiu para varredura completa"
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                FileNotFoundError, OSError) as e:
+            detalhe = (getattr(e, "stderr", "") or str(e)).strip().splitlines() or [""]
+            motivo = (f"o modo diff foi pedido mas o `git diff {ref}` falhou "
+                      f"({detalhe[0][:160]}); a execução caiu para varredura completa")
+            cobertura["motivo_corte"] = motivo
+            cobertura["limitacoes"].append(dict(
+                tipo="modo_diff_indisponivel", descricao=motivo, afeta="todos", itens=[]))
             mode = "rapida"
 
     encontrados: list[Path] = []
