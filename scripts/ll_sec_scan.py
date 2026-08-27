@@ -1497,28 +1497,68 @@ def ler_ignore_do_alvo(root: Path) -> dict:
     return info
 
 
-def aplicar_diff(achados: list[dict], estado_path: Path) -> dict:
-    anterior: set[str] = set()
-    primeira = True
-    if estado_path.exists():
-        try:
-            dados = json.loads(estado_path.read_text(encoding="utf-8"))
-            anterior = set(dados.get("fingerprints", []))
-            primeira = False
-        except Exception:
-            primeira = True
+def ler_linha_de_base(estado_path: Path) -> dict:
+    """A execução anterior, separada em duas listas.
 
-    atuais = {a["fingerprint"] for a in achados}
+    `vulns` é a linha de base do diff — só vulnerabilidade aberta entra ali.
+    `positivos` guarda o que foi conferido e estava são, para detectar o
+    positivo que sumiu (regressão), sem que ele conte como "resolvido": sumir
+    da lista de conferidos não é a mesma coisa que corrigir uma falha.
+    """
+    if not estado_path.exists():
+        return dict(vulns=set(), positivos=set(), primeira=True)
+    try:
+        dados = json.loads(estado_path.read_text(encoding="utf-8"))
+    except Exception:
+        return dict(vulns=set(), positivos=set(), primeira=True)
+    return dict(vulns=set(dados.get("fingerprints", [])),
+                positivos=set(dados.get("positivos", [])), primeira=False)
+
+
+def calcular_diff(achados: list[dict], suprimidos: list[dict], base: dict) -> dict:
+    """A quebra temporal do MESMO placar — contando VULNERABILIDADE, nunca
+    marcação bruta do scanner.
+
+    Três regras, e as três nasceram de um relatório que enganou o operador
+    ("54 novos / 118 conhecidos", lido como 172 problemas quando existiam 40):
+
+    1. **Item `positivo` não entra em número nenhum.** "Verificado e OK" é o
+       oposto de vulnerabilidade; contá-lo aqui inflava o bloco com o que não
+       pede ação.
+    2. **`novas` + `conhecidas` == `abertas`.** São duas parcelas do mesmo
+       total, não duas pilhas para somar. Elas existem para o operador decidir
+       o que atacar primeiro, não para virar um segundo placar.
+    3. **Conhecida e não corrigida CONTINUA aberta.** "Conhecido" quer dizer
+       "já triado antes" — nunca "resolvido", nunca "aceito". Tirar do placar
+       por idade faria o relatório dizer "limpo" com o buraco escancarado, que
+       é o oposto do que esta skill existe para fazer. Só saem do placar o
+       falso positivo descartado na triagem e o risco aceito por escrito no
+       `supressoes.json`.
+
+    `resolvidas` compara contra TUDO que apareceu nesta execução (aberto,
+    positivo ou aceito): fingerprint que virou risco aceito não foi resolvido,
+    mudou de aba.
+    """
+    antes_vuln = set(base.get("vulns") or ())
+    antes_ok = set(base.get("positivos") or ())
+
+    vulns = [a for a in achados if not e_positivo(a)]
     for a in achados:
-        if a.get("estado") == "conhecido":
-            continue  # triagem persistente já classificou; não é novidade
-        a["estado"] = "persistente" if a["fingerprint"] in anterior else "novo"
+        if e_positivo(a):
+            a["estado"] = "positivo"
+        elif a.get("estado") != "conhecido":
+            a["estado"] = "conhecido" if a["fingerprint"] in antes_vuln else "novo"
 
-    resolvidos = sorted(anterior - atuais)
-    return {"primeira_execucao": primeira, "novos": len([a for a in achados if a["estado"] == "novo"]),
-            "persistentes": len([a for a in achados if a["estado"] == "persistente"]),
-            "conhecidos": len([a for a in achados if a["estado"] == "conhecido"]),
-            "resolvidos": len(resolvidos), "fingerprints_resolvidos": resolvidos}
+    presentes = {a["fingerprint"] for a in achados}
+    presentes.update(a["fingerprint"] for a in suprimidos)
+    resolvidas = sorted(f for f in antes_vuln if f not in presentes)
+    ok_sumidos = sorted(f for f in antes_ok if f not in presentes)
+
+    novas = sum(1 for a in vulns if a["estado"] == "novo")
+    return {"primeira_execucao": bool(base.get("primeira")),
+            "abertas": len(vulns), "novas": novas, "conhecidas": len(vulns) - novas,
+            "resolvidas": len(resolvidas), "fingerprints_resolvidos": resolvidas,
+            "positivos_nao_reconferidos": len(ok_sumidos)}
 
 
 # `garantir_gitignore` foi REMOVIDA, não corrigida. Ela existia porque o
@@ -1563,14 +1603,18 @@ h1{font-size:26px;margin:0 0 4px;color:#f0f6fc}
 .sub{color:#8b949e;font-size:13px;margin-bottom:22px}
 .meta{display:flex;flex-wrap:wrap;gap:10px 26px;padding:14px 18px;background:#161b22;border:1px solid #30363d;border-radius:10px;margin-bottom:22px;font-size:13px}
 .meta b{color:#f0f6fc;font-weight:600}
-.placar{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px;margin-bottom:22px}
+.placar{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px;margin-bottom:10px}
 .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px 16px;text-align:center}
 .card .n{font-size:30px;font-weight:700;line-height:1.1}
 .card .l{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:#8b949e;margin-top:4px}
 .critico{color:#ff7b72}.alto{color:#ffa657}.medio{color:#e3b341}.baixo{color:#79c0ff}.informativo{color:#8b949e}
-.diff{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:26px}
-.diff .card{border-left:3px solid #30363d}
-.novo{border-left-color:#ff7b72!important}.persist{border-left-color:#e3b341!important}.resolv{border-left-color:#3fb950!important}
+.total-vuln{font-size:15px;color:#c9d1d9;margin:0 0 10px}
+.total-vuln b{font-size:28px;font-weight:700;color:#f0f6fc;margin-right:7px;vertical-align:-2px}
+.total-vuln span{color:#8b949e;font-size:12.5px}
+.linha-diff{font-size:13px;color:#8b949e;margin:0 0 6px}
+.linha-diff b{color:#f0f6fc}
+.linha-diff.ok,.linha-diff.ok b{color:#7ee787}
+.linha-diff:last-of-type{margin-bottom:22px}
 .tabs{display:flex;flex-wrap:wrap;gap:6px;border-bottom:1px solid #30363d;margin-bottom:18px}
 .tab{padding:9px 15px;cursor:pointer;border:1px solid transparent;border-bottom:none;border-radius:8px 8px 0 0;font-size:13px;color:#8b949e;user-select:none}
 .tab:hover{color:#c9d1d9;background:#161b22}
@@ -1611,8 +1655,8 @@ pre{background:#0d1117;border:1px solid #30363d;border-radius:7px;padding:11px 1
 .q-operador{background:#3a2411;border:1px solid #ffa657;color:#ffc08a}
 .q-ambos{background:#0d2d4d;border:1px solid #79c0ff;color:#a5d6ff}
 .q-nenhuma{background:#21262d;border:1px solid #30363d;color:#8b949e}
-.legenda{margin-bottom:20px}
-.legenda summary{font-size:14px}
+.legenda{margin-bottom:18px}
+.legenda summary{font-size:13px;color:#8b949e;font-weight:500}
 .rolagem{overflow-x:auto;max-width:100%;-webkit-overflow-scrolling:touch}
 .tab-leg{margin-top:12px;min-width:520px}
 .tab-leg td{vertical-align:top;font-size:12.5px}
@@ -1689,16 +1733,16 @@ th{color:#8b949e;font-weight:600;font-size:11.5px;text-transform:uppercase;lette
    regras de duas classes da tela (.tag.sev-critico e afins) ganham por
    especificidade e o fundo escuro sobrevive no papel. */
 .wrap,.wrap *{color:#1f2328!important;text-shadow:none!important}
-.num,.tag,.nota-sel,.selo,.eixo,.aviso,.lim,.diff,.card,.meta,.amostra,
+.num,.tag,.nota-sel,.selo,.eixo,.aviso,.lim,.card,.meta,.amostra,
 .q-agente,.q-operador,.q-ambos,.q-nenhuma,.pt-sim,.pt-nao,.e-limpo,
 .e-achado,.e-nada,.c-completa,.c-parcial,.c-nenhuma,.c-na,.nota-ok,
 .linha-inv.destaque{background:#f6f8fa!important;border-color:#8c959f!important}
 .sub,.card .l,.tag,.q-nenhuma,.pt-nao,.leg-rod,.e-nada,.sub-inv,.just,
 .ver-cap,.gaps summary,.nota-sel.n1,.tag.nota-sel.n1{color:#4b535d!important}
-.loc,.leg-c,.simples b,.q-ambos,.nota-sel.n2,.tag.sev-baixo,.c-na,
-.card.persist{color:#0550ae!important}
+.loc,.leg-c,.simples b,.q-ambos,.nota-sel.n2,.tag.sev-baixo,
+.c-na{color:#0550ae!important}
 .tab-ok,.item.positivo,.q-agente,.e-limpo,.c-completa,
-.card.resolv{color:#0f5323!important}
+.linha-diff.ok,.linha-diff.ok b{color:#0f5323!important}
 .nota-sel.n5,.nota-sel.n4,.tag.sev-critico,.tag.sev-alto,.tag.est-novo,
 .c-nenhuma,.sem-check,.e-achado,.q-operador{color:#8b1a2b!important}
 .nota-sel.n3,.tag.sev-medio,.pt-sim,.c-parcial,.linha-inv.destaque span,
@@ -1800,6 +1844,11 @@ NOTAS = {
 }
 
 
+def so_data(carimbo) -> str:
+    """"26/08/2026 14:03" vira "26/08/2026". A hora não ajuda a decidir nada."""
+    return str(carimbo).split(" ")[0] if carimbo else ""
+
+
 def nota_de(a: dict) -> int:
     return NOTAS.get(a.get("severidade", "informativo"), NOTAS["informativo"])["nota"]
 
@@ -1817,20 +1866,27 @@ def esc(s) -> str:
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
-def render_item(a: dict) -> str:
+def render_item(a: dict, mostrar_estado: bool = True) -> str:
     cat = CATEGORIAS.get(a["categoria"], {})
     info_nota = NOTAS.get(a["severidade"], NOTAS["informativo"])
     tags = [f'<span class="tag nota-sel n{info_nota["nota"]}">NOTA {info_nota["nota"]} · '
             f'{esc(info_nota["rotulo"])}</span>',
             f'<span class="tag">{a["categoria"]} · {esc(cat.get("nome", ""))}</span>',
             f'<span class="tag">{esc(a["regra"])}</span>']
-    if a.get("estado") == "novo":
-        tags.append('<span class="tag est-novo">NOVO</span>')
-    elif a.get("estado") == "persistente":
-        tags.append('<span class="tag">persistente</span>')
-    elif a.get("estado") == "conhecido":
-        rot = a.get("triado_em") or "execução anterior"
-        tags.append(f'<span class="tag">conhecido desde {esc(rot)}</span>')
+    # Etiqueta de origem temporal, POR ITEM. Ela existe para o operador separar
+    # "isto apareceu com a feature nova" de "isto eu já conhecia e ainda não
+    # corrigi" — e é etiqueta, não placar: os dois estados contam igual no total
+    # de vulnerabilidades abertas, porque conhecida e não corrigida continua
+    # aberta.
+    if e_positivo(a) or not mostrar_estado:
+        # "verificado e OK" não é vulnerabilidade, e na primeira execução TODO
+        # item seria "nova" — etiqueta que vale para tudo não informa nada.
+        pass
+    elif a.get("estado") == "novo":
+        tags.append('<span class="tag est-novo">NOVA</span>')
+    else:
+        rot = so_data(a.get("triado_em")) or "a execução anterior"
+        tags.append(f'<span class="tag">conhecida desde {esc(rot)}</span>')
     tags.append(f'<span class="tag">fp {esc(a["fingerprint"])}</span>')
     nota = f'<div class="nota">{esc(a["nota"])}</div>' if a.get("nota") else ""
 
@@ -1899,40 +1955,6 @@ def selo_cobertura(valor: str) -> str:
     return f'<span class="eixo {cls}">{esc(rot)}</span>'
 
 
-def render_legenda(ctx: dict) -> str:
-    """Tabela fixa com TODAS as categorias, agora em DOIS eixos.
-
-    A marca antiga era binária — "com achado" ou "limpo" — e "limpo" saía por
-    ausência de achado, inclusive para categoria que ninguém olhou e para
-    categoria que não tem uma única regra implementada. Agora "o que achei" e
-    "o quanto olhei" são colunas diferentes, e a palavra **limpo** só aparece
-    na interseção `sem_achados` + `cobertura completa`.
-    """
-    categorias = ctx.get("categorias") or {}
-    linhas = []
-    for c, d in CATEGORIAS.items():
-        info = categorias.get(c, dict(resultado="sem_achados", cobertura="nenhuma"))
-        destaque = info.get("resultado") == "com_achados" or info.get("cobertura") != "completa"
-        linhas.append(
-            f'<tr class="{"leg-on" if destaque else ""}">'
-            f'<td class="leg-c">{c}</td>'
-            f'<td class="leg-n">{esc(d["nome"])}</td>'
-            f'<td>{esc(d["simples"])}</td>'
-            f'<td class="leg-m">{selo_resultado(info)}</td>'
-            f'<td class="leg-m">{selo_cobertura(info.get("cobertura", "nenhuma"))}</td></tr>')
-    return f"""<details class="legenda" open>
-<summary>O que significa cada categoria (C1 a C9)</summary>
-<div class="rolagem"><table class="tab-leg"><thead><tr>
-<th>Sigla</th><th>Categoria</th><th>O que é, em uma frase</th>
-<th>O que achei</th><th>O quanto olhei</th>
-</tr></thead><tbody>{''.join(linhas)}</tbody></table></div>
-<p class="leg-rod">São <b>duas perguntas diferentes</b>, e as duas são respondidas sempre.
-<b>"Limpo"</b> só aparece quando nada foi encontrado <b>e</b> a cobertura foi completa.
-<b>Não verificado</b> não é boa notícia: é ausência de resposta. A aba <b>Cobertura</b> diz,
-check a check, o que rodou, o que ficou de fora e por quê.</p>
-</details>"""
-
-
 def render_inventario(inv: dict) -> str:
     """O denominador publicado — e os dois blocos separados de propósito."""
     cod = inv.get("codigo_do_projeto", {})
@@ -1962,13 +1984,12 @@ def render_inventario(inv: dict) -> str:
     html_ext = ", ".join(f"{esc(k)} ({v})" for k, v in list(exts.items())[:16]) or "—"
     return f"""<div class="inv">
 <div class="bloco-inv"><h3>Código do projeto</h3>{html_cod}
-<p class="leg-rod">O denominador que importa. <b>Não reconhecidos</b> é o número a vigiar:
-são arquivos do projeto cujo tipo o scanner não sabe ler — é ali que aparece o próximo furo.</p></div>
+<p class="leg-rod"><b>Não reconhecidos</b> é o número a vigiar: arquivo do projeto cujo tipo o
+scanner não sabe ler é onde aparece o próximo furo.</p></div>
 <div class="bloco-inv"><h3>Excluídos por política <span class="sub-inv">(contados, não analisados)</span></h3>{html_pol}
 <div class="linha-inv total-inv"><span>total</span><b>{num(pol.get('total', 0))}</b></div>
-<p class="leg-rod">Ficam fora por decisão, não por descuido — e aparecem contados para que
-ninguém possa dizer que não sabia que existem. Somar isto ao denominador principal produziria
-uma taxa de cobertura tecnicamente correta e inútil.</p></div>
+<p class="leg-rod">Fora por decisão, não por descuido — contados aqui para ninguém dizer
+que não sabia que existem.</p></div>
 </div>
 <p class="leg-rod">Tipos encontrados no código do projeto: {html_ext}</p>"""
 
@@ -2025,66 +2046,94 @@ def render_html(ctx: dict) -> str:
     contagem = {sev: len([a for a in achados if a["severidade"] == sev and not e_positivo(a)])
                 for sev in SEVS}
 
+    # O PLACAR É A SOMA DAS CINCO NOTAS, E NADA MAIS. Ficam de fora os itens
+    # "verificado e OK" (aba própria), os riscos aceitos (aba própria) e tudo o
+    # que a triagem descartou. O total sai escrito por extenso porque a conta
+    # precisa ser conferível de relance: foi a falta dele que deixou o operador
+    # somar dois números que já se continham.
+    total_abertas = len(achados)
     placar = "".join(
         f'<div class="card"><div class="n {sev}">{contagem[sev]}</div>'
         f'<div class="l">nota {NOTAS[sev]["nota"]} · {esc(NOTAS[sev]["rotulo"])}</div></div>'
         for sev in SEVS
     )
+    titulo_placar = (
+        f'<div class="total-vuln"><b>{total_abertas}</b>'
+        f'{"vulnerabilidade aberta" if total_abertas == 1 else "vulnerabilidades abertas"} '
+        '<span>— a soma das cinco notas abaixo. "Verificado e OK" e riscos aceitos ficam fora.'
+        '</span></div>')
 
     d = ctx["diff"]
-    if d["primeira_execucao"]:
-        bloco_diff = ('<div class="diff"><div class="card" style="grid-column:1/-1">'
-                      '<div class="l">Esta é a primeira execução — não há com o que comparar. '
-                      'Ela vira a linha de base; a próxima mostrará novos, persistentes e resolvidos.</div></div></div>')
+    # A quebra temporal vem como FRASE, não como um segundo grid de cards: dois
+    # placares lado a lado convidam a somar "conhecidas + novas" e chegar ao
+    # dobro do que existe. As duas são parcelas do MESMO total. "Resolvidas" fica
+    # em linha própria — é notícia boa e outra unidade de medida.
+    if d.get("primeira_execucao"):
+        linhas_diff = ('<p class="linha-diff">Primeira execução: não há com o que comparar. '
+                       'Ela vira a linha de base — da próxima vez, cada vulnerabilidade dirá '
+                       'se apareceu depois desta data ou se já vinha de antes.</p>')
     else:
-        card_conhecidos = ((f'<div class="card persist"><div class="n" style="color:#79c0ff">{d["conhecidos"]}</div>'
-                            f'<div class="l">Conhecidos (já triados)</div></div>')
-                           if d.get("conhecidos") else '')
-        bloco_diff = (f'<div class="diff">'
-                      f'<div class="card novo"><div class="n critico">{d["novos"]}</div><div class="l">Novos</div></div>'
-                      f'<div class="card persist"><div class="n medio">{d["persistentes"]}</div><div class="l">Persistentes</div></div>'
-                      f'{card_conhecidos}'
-                      f'<div class="card resolv"><div class="n" style="color:#3fb950">{d["resolvidos"]}</div><div class="l">Resolvidos</div></div>'
-                      f'</div>')
+        nv, ch, rs = d.get("novas", 0), d.get("conhecidas", 0), d.get("resolvidas", 0)
+        linhas_diff = (f'<p class="linha-diff">Do total, <b>{nv}</b> '
+                       f'{"apareceu" if nv == 1 else "apareceram"} desde a execução anterior e '
+                       f'<b>{ch}</b> já {"vinha" if ch == 1 else "vinham"} de antes e '
+                       f'{"continua" if ch == 1 else "continuam"} em aberto. As duas parcelas '
+                       'somam o total acima — não se somam a ele.</p>')
+        if rs:
+            linhas_diff += (f'<p class="linha-diff ok">✓ <b>{rs}</b> '
+                            f'{"vulnerabilidade" if rs == 1 else "vulnerabilidades"} da execução '
+                            f'anterior não {"aparece" if rs == 1 else "aparecem"} mais.</p>')
 
+    cats_info = ctx.get("categorias") or {}
+    n_completa = sum(1 for x in cats_info.values() if x.get("cobertura") == "completa")
+    n_limpa = sum(1 for x in cats_info.values() if e_limpo(x))
+    n_sem = sum(1 for x in cats_info.values() if x.get("cobertura") == "nenhuma")
+    linhas_diff += (f'<p class="linha-diff">Cobertura: <b>{n_completa}</b> de '
+                    f'{len(CATEGORIAS)} categorias verificadas por inteiro, <b>{n_sem}</b> sem '
+                    'verificação — a aba Cobertura diz o que ficou de fora e por quê.</p>')
+
+    mostrar_estado = not d.get("primeira_execucao")
     cats_presentes = [c for c in CATEGORIAS if any(a["categoria"] == c for a in achados)]
     tabs = ['<div class="tab on" data-alvo="p-todos">Todos ({})</div>'.format(len(achados))]
     paineis = ['<div class="painel on" id="p-todos">'
-               + ("".join(render_item(a) for a in achados) or '<div class="vazio">Nenhum achado nesta execução.</div>')
+               + ("".join(render_item(a, mostrar_estado) for a in achados)
+                  or '<div class="vazio">Nenhuma vulnerabilidade aberta nesta execução.</div>')
                + "</div>"]
     for c in cats_presentes:
         itens = [a for a in achados if a["categoria"] == c]
         tabs.append(f'<div class="tab" data-alvo="p-{c}">{c} · {esc(cat_nome(c))} ({len(itens)})</div>')
-        paineis.append(f'<div class="painel" id="p-{c}">' + "".join(render_item(a) for a in itens) + "</div>")
+        paineis.append(f'<div class="painel" id="p-{c}">'
+                       + "".join(render_item(a, mostrar_estado) for a in itens) + "</div>")
 
+    # UMA legenda, fechada. As duas tabelas grandes que ficavam abertas acima
+    # das abas repetiam o que os selos de cada achado já dizem e empurravam a
+    # lista para baixo da dobra. O que aqui é glossário fica a um clique; os
+    # dois eixos por categoria (o que achei × o quanto olhei) continuam
+    # inteiros, com o motivo de cada um, na aba Cobertura.
     linhas_nota = "".join(
-        f'<tr><td class="leg-c"><span class="nota-sel n{d["nota"]}">{d["nota"]}</span></td>'
-        f'<td class="leg-n">{esc(d["rotulo"])}</td><td>{esc(d["desc"])}</td>'
-        f'<td class="leg-m">{contagem[sev]} nesta execução</td></tr>'
-        for sev, d in sorted(NOTAS.items(), key=lambda kv: -kv[1]["nota"]))
-    legenda_notas = f"""<details class="legenda" open>
-<summary>O que significa a nota de risco (1 a 5)</summary>
-<div class="rolagem"><table class="tab-leg"><thead><tr>
-<th>Nota</th><th>Nível</th><th>O que quer dizer</th><th>Nesta execução</th>
-</tr></thead><tbody>{linhas_nota}</tbody></table></div>
+        f'<tr><td class="leg-c"><span class="nota-sel n{n["nota"]}">{n["nota"]}</span></td>'
+        f'<td class="leg-n">{esc(n["rotulo"])}</td><td>{esc(n["desc"])}</td></tr>'
+        for _sev, n in sorted(NOTAS.items(), key=lambda kv: -kv[1]["nota"]))
+    linhas_cat = "".join(
+        f'<tr><td class="leg-c">{c}</td><td class="leg-n">{esc(x["nome"])}</td>'
+        f'<td>{esc(x["simples"])}</td></tr>' for c, x in CATEGORIAS.items())
+    legenda = f"""<details class="legenda">
+<summary>Como ler: as cinco notas de risco e as nove categorias</summary>
+<div class="rolagem"><table class="tab-leg"><tbody>{linhas_nota}</tbody></table></div>
 <p class="leg-rod">A nota é dada por <b>quem consegue explorar</b> a falha, não por quanto ela
-parece grave. Na dúvida entre duas notas, vale a menor — e o achado diz o que falta para
-confirmar. Os itens da aba "Verificado e OK" não entram nesta contagem.</p>
+parece grave. Na dúvida entre duas, vale a menor, e o achado diz o que falta para confirmar.</p>
+<div class="rolagem"><table class="tab-leg"><tbody>{linhas_cat}</tbody></table></div>
 </details>"""
 
     if positivos:
         tabs.append(f'<div class="tab tab-ok" data-alvo="p-ok">✓ Verificado e OK ({len(positivos)})</div>')
         paineis.append(
             '<div class="painel" id="p-ok">'
-            '<div class="nota-ok">Nada aqui pede ação. São pontos que foram conferidos nesta '
-            'execução e estavam corretos — ficam registrados para a próxima auditoria comparar: '
-            'se um deles sumir da lista, alguma coisa regrediu.</div>'
+            '<div class="nota-ok">Nada aqui pede ação: conferido nesta execução e correto. '
+            'Fica registrado para a próxima comparar — se um item sumir, algo regrediu.</div>'
             + "".join(render_item(a) for a in positivos) + "</div>")
 
     cob = ctx["cobertura"]
-    cats_info = ctx.get("categorias") or {}
-    n_completa = sum(1 for d in cats_info.values() if d.get("cobertura") == "completa")
-    n_limpa = sum(1 for d in cats_info.values() if e_limpo(d))
     linhas_cob = [
         ("Modo executado", ctx["modo"]),
         ("Stacks detectadas", ", ".join(ctx["recon"]["stacks"]) or "nenhuma reconhecida"),
@@ -2097,9 +2146,34 @@ confirmar. Os itens da aba "Verificado e OK" não entram nesta contagem.</p>
     ]
     if cob.get("motivo_corte"):
         linhas_cob.append(("Motivo do corte", cob["motivo_corte"]))
+
+    # Volume BRUTO do scanner. Ele mede "o quanto olhei", não "o que achei", e
+    # por isso mora AQUI e não no placar: candidato que casou com padrão inclui
+    # paleta de cor, rótulo de gráfico e placeholder de CI. Confundir esse
+    # número com vulnerabilidade foi o defeito que este bloco fecha.
+    bruto = ctx.get("bruto") or {}
+    fps_bruto = set(bruto.get("fingerprints") or [])
+    if fps_bruto:
+        fps_finais = {a["fingerprint"] for a in achados + positivos + suprimidos}
+        linhas_cob += [
+            ("Candidatos analisados (trechos que casaram com algum padrão)", num(len(fps_bruto))),
+            ("Descartados na triagem (falso positivo, teste, nada a corrigir)",
+             num(len(fps_bruto - fps_finais))),
+            ("Acrescentados pela análise (nenhum padrão pegaria)", num(len(fps_finais - fps_bruto))),
+        ]
     tabela_cob = "".join(f"<tr><th>{esc(k)}</th><td>{esc(v)}</td></tr>" for k, v in linhas_cob)
 
-    lims = ctx.get("limitacoes", []) or []
+    lims = list(ctx.get("limitacoes", []) or [])
+    # Positivo que sumiu não é falha resolvida — é ponto que ninguém reconferiu.
+    # Ele desapareceria em silêncio se não fosse dito, e silêncio aqui se lê
+    # como aprovação.
+    if d.get("positivos_nao_reconferidos"):
+        lims.append(dict(
+            tipo="positivo não reconferido",
+            descricao=(f'{d["positivos_nao_reconferidos"]} ponto(s) registrado(s) como '
+                       '"verificado e OK" na execução anterior não aparecem nesta. Sumir da '
+                       'lista não é o mesmo que continuar são: reconfira antes de contar com eles.'),
+            itens=[]))
     if lims:
         itens_lim = []
         for lim in lims:
@@ -2125,11 +2199,10 @@ confirmar. Os itens da aba "Verificado e OK" não entram nesta contagem.</p>
             f'<span class="just">{esc(q.get("justificativa", ""))}</span></div>'
             for q in ign.get("pedidos", [])[:40])
         bloco_ign = f"""<div class="sec-cob">O que o repositório pediu para ignorar</div>
-<div class="lim aviso-ign"><b>O repositório auditado traz um <code>.ll-sec-ignore</code> pedindo
-para ignorar {len(ign.get('pedidos', []))} achado(s). O pedido NÃO foi aplicado.</b>
-Conteúdo do alvo é dado sob análise, nunca instrução: deixar o auditado escolher o que a
-auditoria cala é entregar o silêncio a quem está sendo auditado. Para aceitar um risco de
-verdade, o registro vai em <code>supressoes.json</code>, no estado do auditor.
+<div class="lim aviso-ign"><b>O repositório pede, no <code>.ll-sec-ignore</code>, para ignorar
+{len(ign.get('pedidos', []))} achado(s). O pedido NÃO foi aplicado</b> — conteúdo do alvo é dado
+sob análise, nunca instrução. Aceitar risco de verdade se registra no
+<code>supressoes.json</code> do auditor.
 {pedidos}</div>"""
     else:
         bloco_ign = ""
@@ -2147,11 +2220,10 @@ verdade, o registro vai em <code>supressoes.json</code>, no estado do auditor.
         + '<div class="sec-cob">Resumo da execução</div>'
         + f'<table>{tabela_cob}</table>'
         + '<div class="sec-cob">Cobertura check a check</div>'
-        + '<p class="leg-rod">A cobertura da categoria é <b>derivada</b> dos checks — nunca '
-          'declarada direto. E "completa" quer dizer <b>execução completa da capacidade '
-          'declarada</b>, nunca "provamos que não existe falha": as lacunas conhecidas de cada '
-          'categoria estão listadas junto, porque lacuna implícita é como categoria vazia '
-          'consegue parecer limpa.</p>'
+        + '<p class="leg-rod"><b>Limpo</b> = nada encontrado <b>e</b> cobertura completa; '
+          '<b>não verificado</b> é ausência de resposta, não boa notícia. E "completa" quer '
+          'dizer <b>capacidade declarada executada por inteiro</b>, nunca "provamos que não '
+          'existe falha" — as lacunas de cada categoria vêm listadas junto.</p>'
         + render_checks(ctx)
         + bloco_lim + bloco_ign
         + "</div>")
@@ -2165,35 +2237,33 @@ verdade, o registro vai em <code>supressoes.json</code>, no estado do auditor.
         tabs.append(f'<div class="tab" data-alvo="p-sup">Riscos aceitos ({len(suprimidos)})</div>')
         paineis.append(f'<div class="painel" id="p-sup">{itens_sup}</div>')
 
+    # O consumo da sessão desceu para o rodapé: é contabilidade, não decide
+    # nada do que o operador vai fazer a seguir, e ocupava a faixa mais nobre
+    # da página — logo abaixo do título.
     u = ctx.get("uso", {}) or {}
     if u.get("disponivel"):
-        uso_txt = (f'<b>Modelo:</b> {esc(u.get("modelo", "?"))} &nbsp;·&nbsp; '
-                   f'<b>Tokens de entrada:</b> {u.get("input_tokens", 0):,} &nbsp;·&nbsp; '
-                   f'<b>Saída:</b> {u.get("output_tokens", 0):,} &nbsp;·&nbsp; '
-                   f'<b>Cache:</b> {u.get("cache_read_tokens", 0):,}').replace(",", ".")
+        uso_txt = ("<br>Consumo da sessão (não inclui a geração deste relatório): "
+                   f'{esc(u.get("modelo", "?"))} · entrada {num(u.get("input_tokens", 0))} · '
+                   f'saída {num(u.get("output_tokens", 0))} · cache {num(u.get("cache_read_tokens", 0))}')
     else:
-        uso_txt = f'<b>Consumo da sessão:</b> indisponível ({esc(u.get("motivo", "formato não reconhecido"))})'
+        uso_txt = ""
 
     return f"""<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ll-sec — {esc(ctx['projeto'])}</title><style>{CSS}</style></head><body><div class="wrap">
 <h1>Auditoria de segurança — {esc(ctx['projeto'])}</h1>
 <div class="sub">{esc(ctx['gerado_em'])} · modo <b>{esc(ctx['modo'])}</b> · somente leitura, nenhum código alterado</div>
-<div class="aviso"><b>Este arquivo é um mapa de vulnerabilidades.</b> Não commite, não anexe em
-ticket público e não mande por canal inseguro. Ele foi gravado <b>fora do repositório auditado</b>
-(<code>{esc(ctx.get('saida', ''))}</code>), com permissão 600 — a auditoria não escreveu um byte
-dentro do projeto.</div>
-<div class="meta">{uso_txt}</div>
-{bloco_diff}
+<div class="aviso"><b>Mapa de vulnerabilidades — não commite nem mande por canal inseguro.</b>
+Gravado fora do repositório auditado, com permissão 600; nenhum byte foi escrito no projeto.</div>
+{titulo_placar}
 <div class="placar">{placar}</div>
-{legenda_notas}\n{render_legenda(ctx)}
+{linhas_diff}
+{legenda}
 <div class="tabs">{''.join(tabs)}</div>
 {''.join(paineis)}
 <div class="rodape">
-Gerado por <b>ll-sec</b> · Achados marcados como <i>informativo</i> são suspeitas não confirmadas —
-cada um diz o que falta para confirmar. Nenhum achado foi corrigido automaticamente.<br>
-O bloco de consumo cobre a sessão inteira do Claude Code até o momento da leitura e
-<b>não inclui a geração deste relatório</b>; para medir só esta auditoria, rode-a numa sessão nova.
+Gerado por <b>ll-sec</b> · nada foi corrigido automaticamente. Achado <i>informativo</i> é
+suspeita não confirmada e diz o que falta para confirmar.{uso_txt}
 </div>
 </div><script>{JS}</script></body></html>"""
 
@@ -2264,15 +2334,12 @@ def cmd_scan(args):
         a["estado"] = "conhecido"
         a["triado_em"] = t.get("data", "")
 
-    # Fingerprints da execução anterior, guardados no payload para o render
-    # decidir novo/persistente sobre a lista FINAL (pós-triagem do agente).
-    caminho_estado = estado["dir"] / "estado.json"
-    try:
-        anteriores = json.loads(caminho_estado.read_text(encoding="utf-8")).get("fingerprints", [])
-    except Exception:
-        anteriores = []
+    # Linha de base da execução anterior, guardada no payload para o render
+    # decidir nova/conhecida sobre a lista FINAL (pós-triagem do agente).
+    base = ler_linha_de_base(estado["dir"] / "estado.json")
+    anteriores = sorted(base["vulns"])
 
-    diff = aplicar_diff(restantes, caminho_estado)
+    diff = calcular_diff(restantes, suprimidos, base)
     if estado["reset"]:
         cobertura["limitacoes"].append(dict(
             tipo="reset_de_identidade", descricao=estado["motivo_reset"],
@@ -2293,6 +2360,14 @@ def cmd_scan(args):
         identidade=estado["identidade"], reset_de_identidade=estado["motivo_reset"],
         saida=str(out), checks=checks, categorias=categorias,
         inventario=montar_inventario(cobertura),
+        estado_anterior_positivos=sorted(base["positivos"]),
+        # Volume BRUTO do scanner: quantos trechos casaram com padrão antes de
+        # qualquer triagem. Não é medida de "o que achei", é de "o quanto olhei"
+        # — o render usa isso para publicar candidatos e descartes na aba
+        # Cobertura, longe do placar. Marcação bruta no placar foi exatamente o
+        # que fez 118 falsos positivos passarem por vulnerabilidade.
+        bruto=dict(candidatos=len(achados),
+                   fingerprints=[a["fingerprint"] for a in achados]),
     )
     destino = out / "findings.json"
     escrever_estado(destino, json.dumps(payload, ensure_ascii=False, indent=2))
@@ -2336,28 +2411,16 @@ def cmd_render(args):
         except Exception:
             dados["uso"] = {"disponivel": False, "motivo": "JSON de consumo ilegível"}
 
-    # novo x persistente é decidido AQUI, sobre a lista final — não sobre os
-    # achados crus do scan. O agente acrescenta e remove itens na triagem, e um
-    # achado que ele reescreveu mas que já existia na execução anterior não pode
-    # aparecer como novidade: "10 novos" quando nada mudou destrói a confiança
-    # no bloco de diff, que é a parte do relatório que o operador lê primeiro.
-    anteriores = set(dados.get("estado_anterior") or [])
-    if anteriores:
-        for a in dados["achados"] + dados.get("suprimidos", []):
-            if a.get("estado") == "conhecido":
-                continue
-            a["estado"] = "persistente" if a["fingerprint"] in anteriores else "novo"
-
-        atuais = {a["fingerprint"] for a in dados["achados"]}
-        resolvidos = sorted(anteriores - atuais)
-        dados["diff"] = {
-            "primeira_execucao": False,
-            "novos": len([a for a in dados["achados"] if a["estado"] == "novo"]),
-            "persistentes": len([a for a in dados["achados"] if a["estado"] == "persistente"]),
-            "conhecidos": len([a for a in dados["achados"] if a["estado"] == "conhecido"]),
-            "resolvidos": len(resolvidos),
-            "fingerprints_resolvidos": resolvidos,
-        }
+    # nova x conhecida é decidido AQUI, sobre a lista FINAL — nunca sobre os
+    # achados crus do scan. O agente acrescenta, rebaixa e descarta itens na
+    # triagem; contar a marcação bruta é o que produzia "118 conhecidos" quando
+    # 104 daqueles eram paleta de cor, rótulo de gráfico e placeholder de CI.
+    # Recalcula SEMPRE (mesmo sem linha de base), porque a lista que vale é a
+    # que o operador vai ler.
+    base = dict(vulns=set(dados.get("estado_anterior") or []),
+                positivos=set(dados.get("estado_anterior_positivos") or []),
+                primeira=bool((dados.get("diff") or {}).get("primeira_execucao")))
+    dados["diff"] = calcular_diff(dados["achados"], dados.get("suprimidos", []), base)
 
     # O eixo `resultado` é recalculado sobre a lista FINAL (o agente rebaixou,
     # descartou e acrescentou achados); o eixo `cobertura` não se recalcula
@@ -2394,9 +2457,13 @@ def cmd_render(args):
     escrever_estado(tri_path, json.dumps(tri, ensure_ascii=False, indent=1))
 
     # Fecha a execução: o estado passa a ser a lista que o operador de fato viu.
+    # As duas listas ficam SEPARADAS de propósito — `fingerprints` é a linha de
+    # base do diff e só carrega vulnerabilidade aberta; positivo misturado ali
+    # fazia um "verificado e OK" que sumia ser contado como falha resolvida.
     escrever_estado(estado["dir"] / "estado.json", json.dumps(
         {"data": dados.get("gerado_em", ""), "modo": dados.get("modo", ""),
-         "fingerprints": [a["fingerprint"] for a in dados["achados"]]},
+         "fingerprints": [a["fingerprint"] for a in dados["achados"] if not e_positivo(a)],
+         "positivos": [a["fingerprint"] for a in dados["achados"] if e_positivo(a)]},
         ensure_ascii=False, indent=2))
     saida_exit = decidir_exit(dados)
     print(json.dumps({"html": str(destino), "achados": len(dados["achados"]),

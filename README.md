@@ -41,10 +41,17 @@ Sem argumento, ela pergunta o modo antes de começar.
 Gerado sobre o app de teste que vem no repositório.
 [Ver a página inteira](docs/relatorio-completo.png).
 
-Arquivo HTML único, offline, tema escuro, imprimível. Traz placar por nota de
-risco, legenda das nove categorias, abas nomeadas, uma aba de cobertura com o
-que não deu para avaliar, uma aba de riscos aceitos e uma aba "Verificado e OK",
-que separa "conferi e está certo" de "ninguém olhou".
+Arquivo HTML único, offline, tema escuro, imprimível. Abre com o total de
+vulnerabilidades abertas, que é a soma exata dos cinco cartões de nota de risco
+e nada mais. Abaixo dele, em frases curtas: quantas apareceram desde a execução
+anterior e quantas já vinham de antes e continuam abertas (as duas parcelas
+somam o total, não se somam a ele), e quantas foram resolvidas desde então.
+
+Depois vêm as abas: uma por categoria, uma de cobertura com o que não deu para
+avaliar e quantos candidatos brutos foram descartados na triagem, uma de riscos
+aceitos e uma "Verificado e OK", que separa "conferi e está certo" de "ninguém
+olhou". O que a triagem descartou, o que foi conferido e está certo e o risco
+aceito por escrito ficam fora do placar.
 
 Cada achado sai com três campos que costumam faltar num scanner:
 
