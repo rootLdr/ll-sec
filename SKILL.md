@@ -36,8 +36,9 @@ algo, o relatório mostra o pedido e segue reportando.
 
 **O placar é a soma das cinco severidades, e nada mais.** Crítico + alto +
 médio + baixo + informativo = as vulnerabilidades abertas que a auditoria
-encontrou. O que a triagem descartou, o item `"tipo": "positivo"` e o risco
-aceito por escrito ficam **fora** do placar, cada um na sua aba. Volume bruto do
+encontrou. O que a triagem descartou, o item `"tipo": "positivo"`, o risco
+aceito por escrito e a pendência de segurança registrada ficam **fora** do
+placar, cada um na sua aba. Volume bruto do
 scanner — quantos trechos casaram com padrão — mede *o quanto olhei*, não *o que
 achei*: vive na aba Cobertura e nunca no placar. Detalhe em **5.1**.
 
@@ -251,9 +252,10 @@ permissão `600`. O comando imprime o caminho absoluto; **passe esse caminho ao
 operador**. Arquivo único, offline, tema escuro, imprimível.
 
 A página abre com **o total de vulnerabilidades abertas**, os cinco cartões de
-nota que somam esse total, três linhas curtas (quebra temporal, resolvidas,
-cobertura), a legenda recolhida e as abas nomeadas (`C4 · Segredos expostos`,
-não `C4` seco), incluindo Cobertura, "✓ Verificado e OK" e "Riscos aceitos".
+nota que somam esse total, as linhas curtas de contexto (quebra temporal,
+resolvidas, cobertura e, havendo, pendências), a legenda recolhida e as abas nomeadas (`C4 · Segredos expostos`,
+não `C4` seco), incluindo Cobertura, "✓ Verificado e OK", "Riscos aceitos" e
+"Pendências".
 Cada achado sai com a frase em português claro, o selo de quem consegue
 corrigir, a linha de correção e a etiqueta de origem temporal.
 
@@ -278,6 +280,7 @@ Ficam **fora** do placar, e cada um tem lugar próprio:
 | Descartado na triagem (falso positivo, valor de teste, nada a corrigir) | não vira achado; entra em "descartados na triagem", na aba Cobertura |
 | `"tipo": "positivo"` — conferido e correto | aba "✓ Verificado e OK" |
 | Risco aceito por escrito no `supressoes.json` | aba "Riscos aceitos" |
+| Pendência de segurança registrada no `pendencias.json` | aba "Pendências", mais uma linha de contagem abaixo do placar |
 | Candidato bruto do scanner (trecho que casou com padrão) | aba Cobertura, como "candidatos analisados" |
 
 O último é o que mais engana: **marcação bruta não é vulnerabilidade.** Uma
@@ -297,7 +300,12 @@ placar saem, no máximo, três frases curtas:
 - quantas foram **resolvidas** desde a execução anterior — linha própria, em
   verde: é outra unidade de medida e é notícia boa, nunca número para somar
   com as abertas;
-- o resumo de cobertura em uma linha.
+- o resumo de cobertura em uma linha;
+- quantos itens estão **em pendência de segurança**, quando houver — linha de
+  contexto, no mesmo tom cinza das outras: ela conta, não pontua. Pendência sai
+  do placar por decisão do operador, mas não pode sair de vista, senão um
+  relatório abriria com "0 vulnerabilidades abertas" e três buracos enfileirados
+  logo abaixo.
 
 Cada vulnerabilidade aberta leva no próprio cartão a etiqueta **NOVA** ou
 **conhecida desde DD/MM/AAAA**. É etiqueta por item, para você decidir o que
@@ -308,8 +316,10 @@ etiqueta que vale para todos os itens não informa nada.
 quer dizer *já triada antes* — nunca *resolvida*, nunca *aceita*. Se um achado
 antigo saísse do placar só por ser antigo, o relatório passaria a dizer "limpo"
 com o buraco escancarado, que é exatamente o que esta skill existe para impedir.
-Só saem do placar duas coisas: o falso positivo que **você** descartou na
-triagem e o risco que o **operador** aceitou por escrito no `supressoes.json`.
+Só saem do placar três coisas: o falso positivo que **você** descartou na
+triagem, o risco que o **operador** aceitou por escrito no `supressoes.json` e a
+pendência que o **operador** mandou registrar no `pendencias.json`. As duas
+últimas são decisão dele, nunca sua, e cada uma continua listada na sua aba.
 
 ### 5.2 Positivos ficam em aba separada
 
@@ -335,7 +345,7 @@ lista de conferidos não é o mesmo que continuar são.
 
 Cada achado sai do renderizador com um número visível — `#01`, `#02`, … — na
 ordem final do relatório, contínua e única (os riscos aceitos seguem a mesma
-sequência). É o apelido que o operador usa para falar do item: *"me explica o
+sequência, e as pendências vêm depois deles, na mesma). É o apelido que o operador usa para falar do item: *"me explica o
 #03"*, *"o #07 já foi resolvido?"*. Ele é atribuído no render, não no scan, e
 não é o fingerprint: **muda entre execuções**, porque a lista muda.
 
@@ -358,6 +368,12 @@ O molde da frase de recorrência é este, e **os dois números nunca se somam**:
 
 > "São **N** vulnerabilidades abertas: **X** apareceram desde a última execução
 > e **Y** você já conhecia e continuam abertas. **Z** foram resolvidas."
+
+**Havendo pendência, diga o número junto** — logo depois do total, na mesma
+respiração, sem transformá-lo em segundo placar: *"…e **P** itens estão em
+pendência de segurança, fora do placar."* Fechar com "N abertas" e calar sobre a
+fila que você mesmo tirou da conta é o jeito mais fácil de o relatório mentir
+por omissão.
 
 Nunca apresente marcação bruta do scanner como se fosse achado. Se quiser citar
 o esforço da varredura ("olhei 24 candidatos, descartei 3"), diga que é
@@ -480,20 +496,50 @@ nessa contagem.
   DD/MM/AAAA" no cartão. O caso de uso é o de sempre: você corrige hoje, faz uma
   feature nova na semana que vem e roda de novo — o relatório precisa mostrar o
   que apareceu **com a feature nova** sem esquecer o que ficou para trás. Some
-  do placar apenas o falso positivo descartado na triagem e o risco aceito por
-  escrito no `supressoes.json`.
+  do placar apenas o falso positivo descartado na triagem, o risco aceito por
+  escrito no `supressoes.json` e a pendência registrada no `pendencias.json`.
 - **A linha de base separa vulnerabilidade de positivo.** No `estado.json`,
   `fingerprints` guarda só as vulnerabilidades abertas — é contra ela que o
   diff compara — e `positivos` guarda o que foi conferido e estava são.
   Misturados, um positivo que sumisse era contado como "vulnerabilidade
   resolvida"; separados, ele vira o aviso de "positivo não reconferido" na aba
   Cobertura. **Resolvida** quer dizer que o fingerprint não aparece mais em
-  lugar nenhum: virar risco aceito não é resolver, é mudar de aba.
+  lugar nenhum: virar risco aceito não é resolver, é mudar de aba — e **mover
+  para pendência também não é resolver**, é mudar de aba do mesmo jeito. O que
+  protege os dois de aparecerem como vitória em verde não é a linha de base, é o
+  diff: eles entram no conjunto do que apareceu nesta execução, então nunca caem
+  em "resolvidas".
 - **Supressão**: `~/.local/state/ll-sec/<repo-id>/supressoes.json`, um objeto
   `{"<fingerprint>": "justificativa e data"}`. Suprimido não some: vai para a
   aba "Riscos aceitos" com a justificativa à vista. **A skill nunca escreve
   nesse arquivo** — aceitar risco é decisão do operador, e uma ferramenta que se
   auto-silencia não serve para auditar nada.
+- **Pendência de segurança**: `~/.local/state/ll-sec/<repo-id>/pendencias.json`,
+  do lado do `supressoes.json` e com a mesma mecânica — o item sai do placar e
+  da quebra temporal e vai para a aba **"Pendências"** com a justificativa à
+  vista, mais uma linha de contagem abaixo do placar. A intenção é que é outra:
+  risco aceito é *"convivo com isso"*; pendência é *"vou tratar isso, só que não
+  agora"* — melhoria planejada que o operador não quer reler como novidade a
+  cada varredura. Duas formas valem, escolha a que for mais curta:
+
+  ```json
+  {
+    "<fingerprint>": "motivo em uma linha",
+    "<fingerprint>": {"motivo": "...", "registrado_em": "DD/MM/AAAA", "prazo": "..."}
+  }
+  ```
+
+  `registrado_em` e `prazo` são opcionais e só aparecem no cartão quando
+  existirem. **Precedência: supressão vence pendência.** Fingerprint que estiver
+  nos dois arquivos é risco aceito — aceitar é decisão mais forte que enfileirar
+  trabalho, e um item não pode figurar em duas abas com dois números.
+
+  **Quem escreve:** aqui, ao contrário do `supressoes.json`, você *pode* escrever
+  — **e só quando o operador pedir explicitamente**. Nunca por iniciativa
+  própria, nem "para limpar o relatório", nem porque o achado parece grande
+  demais para esta sessão: ferramenta que se auto-desmarca do placar não audita
+  nada. Para tirar da pendência — porque foi corrigido ou porque voltou a ser
+  prioridade — apague a entrada, igual aos outros arquivos de estado.
 - **`.ll-sec-ignore` dentro do repositório auditado não silencia nada.** Ele é
   lido, o pedido aparece no relatório ("o repositório pede para ignorar N
   achados") e os achados **continuam listados**. O motivo é de fronteira, não de
@@ -516,6 +562,7 @@ segredo. Se você acrescentar um achado com segredo à mão, masque também.
 ├── triagem.json         memória de triagem — escrito pelo render
 ├── analise.json         achados de análise INTEIROS — escrito pelo render, apagado à mão
 ├── supressoes.json      riscos aceitos — escrito por VOCÊ, nunca pela skill
+├── pendencias.json      pendências de segurança — escrito por VOCÊ, só quando o operador pedir
 └── relatorios/          findings.json + os HTML
 <repositório auditado>/  nada. Nenhum byte.
 ```
@@ -529,3 +576,10 @@ que ele tentaria criar já existe inteira aqui, no `triagem.json`, no
 Esse diretório concentra o mapa de vulnerabilidade de **todos** os projetos da
 máquina: `0700`/`0600` é o mínimo, e ele não deve entrar em backup sincronizado
 nem em pasta espelhada para nuvem.
+
+O `pendencias.json` merece a mesma cautela dos outros, por um motivo próprio:
+ele é a lista, por escrito, dos buracos que **se sabe que estão abertos e que
+ninguém foi tratar ainda** — o arquivo mais útil que existe para quem quisesse
+atacar o projeto. Como os demais, mora fora do repositório auditado, nasce
+`0600` e não vai para backup sincronizado. Nunca o copie para dentro do projeto,
+nem para um ticket público, nem para o corpo de um e-mail.

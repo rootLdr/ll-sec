@@ -1425,7 +1425,8 @@ def abrir_estado(root: Path, repo_id: str | None = None) -> dict:
                       "Mover, reclonar ou substituir o projeto começa do zero de propósito — "
                       "falso reset é melhor que herdar a memória de outro repositório.")
             carimbo = datetime.now().strftime("%Y%m%d-%H%M%S")
-            for nome in ("estado.json", "triagem.json", "supressoes.json"):
+            for nome in ("estado.json", "triagem.json", "supressoes.json",
+                         "pendencias.json"):
                 alvo = pasta / nome
                 if alvo.exists():
                     alvo.rename(pasta / f"{nome}.pre-reset-{carimbo}")
@@ -1468,10 +1469,60 @@ def carregar_supressoes(estado_dir: Path) -> dict[str, str]:
     return {str(k): (str(v) if v else "(sem justificativa)") for k, v in dados.items()}
 
 
+def carregar_pendencias(estado_dir: Path) -> dict[str, dict]:
+    """Pendência de segurança: `pendencias.json`, ao lado do `supressoes.json`.
+
+    Mesma mecânica da supressão, intenção diferente. Risco aceito é "decidi
+    conviver com isso"; pendência é "vou tratar isso, mas não agora" — trabalho
+    planejado que o operador não quer reler como novidade a cada varredura. O
+    item sai do placar e da quebra temporal, e vai para a aba Pendências com a
+    justificativa à vista.
+
+    **Precedência: supressão vence pendência.** Se o mesmo fingerprint estiver
+    nos dois arquivos, ele é risco aceito — aceitar é decisão mais forte (e mais
+    definitiva) que enfileirar trabalho, e um item não pode aparecer em duas
+    abas com dois números diferentes.
+
+    Duas formas são aceitas, para o operador não ter de decorar formato:
+      "fp": "motivo"                                    → só a justificativa
+      "fp": {"motivo": ..., "registrado_em": ..., "prazo": ...}
+
+    Arquivo ausente, JSON quebrado ou raiz que não é objeto viram dicionário
+    vazio: estado ilegível não pode derrubar a auditoria nem, pior, silenciar
+    achado por acidente.
+    """
+    arq = estado_dir / "pendencias.json"
+    if not arq.exists():
+        return {}
+    try:
+        dados = json.loads(arq.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(dados, dict):
+        return {}
+    saida: dict[str, dict] = {}
+    for k, v in dados.items():
+        if not k:
+            continue
+        if isinstance(v, dict):
+            motivo = str(v.get("motivo") or "").strip()
+            item = dict(motivo=motivo or "(sem justificativa)")
+            for campo in ("registrado_em", "prazo"):
+                valor = str(v.get(campo) or "").strip()
+                if valor:
+                    item[campo] = valor
+        else:
+            item = dict(motivo=(str(v).strip() if v else "") or "(sem justificativa)")
+        saida[str(k)] = item
+    return saida
+
+
 # Campos que NÃO viajam para o `analise.json`: ou são atribuídos a cada
 # execução (`numero`, `estado`, `reinjetado`, `reconferir`) ou pertencem a outro
-# arquivo de estado (`justificativa` mora no `supressoes.json`).
-VOLATEIS_ANALISE = ("numero", "estado", "reinjetado", "reconferir", "justificativa")
+# arquivo de estado (`justificativa` mora no `supressoes.json`, `pendencia` no
+# `pendencias.json`).
+VOLATEIS_ANALISE = ("numero", "estado", "reinjetado", "reconferir", "justificativa",
+                    "pendencia")
 # Contabilidade interna do próprio `analise.json`, que não deve poluir o achado
 # devolvido ao relatório.
 INTERNOS_ANALISE = ("arquivo_mtime", "conferido_em")
@@ -1688,7 +1739,8 @@ def ler_linha_de_base(estado_path: Path) -> dict:
                 positivos=set(dados.get("positivos", [])), primeira=False)
 
 
-def calcular_diff(achados: list[dict], suprimidos: list[dict], base: dict) -> dict:
+def calcular_diff(achados: list[dict], suprimidos: list[dict], base: dict,
+                  pendentes: list[dict] | None = None) -> dict:
     """A quebra temporal do MESMO placar — contando VULNERABILIDADE, nunca
     marcação bruta do scanner.
 
@@ -1705,12 +1757,15 @@ def calcular_diff(achados: list[dict], suprimidos: list[dict], base: dict) -> di
        "já triado antes" — nunca "resolvido", nunca "aceito". Tirar do placar
        por idade faria o relatório dizer "limpo" com o buraco escancarado, que
        é o oposto do que esta skill existe para fazer. Só saem do placar o
-       falso positivo descartado na triagem e o risco aceito por escrito no
-       `supressoes.json`.
+       falso positivo descartado na triagem, o risco aceito por escrito no
+       `supressoes.json` e a pendência registrada no `pendencias.json` — as
+       duas últimas por decisão explícita do operador, cada uma na sua aba.
 
     `resolvidas` compara contra TUDO que apareceu nesta execução (aberto,
-    positivo ou aceito): fingerprint que virou risco aceito não foi resolvido,
-    mudou de aba. Achado de análise entra nessa comparação porque o scan o
+    positivo, aceito ou em pendência): fingerprint que virou risco aceito não
+    foi resolvido, mudou de aba — e mover para PENDÊNCIA também não é resolver.
+    Deixar a pendência cair em `resolvidas` seria pintar de verde, como vitória,
+    o buraco que o próprio operador registrou que ainda vai tratar. Achado de análise entra nessa comparação porque o scan o
     REINJETA a partir do `analise.json` — a lista que chega aqui já é completa.
     Sem a reinjeção ele desapareceria da varredura e cairia direto em
     `resolvidas`, e o relatório diria "resolvida" sobre código intacto.
@@ -1727,6 +1782,7 @@ def calcular_diff(achados: list[dict], suprimidos: list[dict], base: dict) -> di
 
     presentes = {a["fingerprint"] for a in achados}
     presentes.update(a["fingerprint"] for a in suprimidos)
+    presentes.update(a["fingerprint"] for a in (pendentes or ()))
     resolvidas = sorted(f for f in antes_vuln if f not in presentes)
     ok_sumidos = sorted(f for f in antes_ok if f not in presentes)
 
@@ -2212,12 +2268,14 @@ def render_checks(ctx: dict) -> str:
 def render_html(ctx: dict) -> str:
     achados = ctx["achados"]
     suprimidos = ctx["suprimidos"]
+    pendentes = ctx.get("pendentes") or []
 
     # Numeração única e contínua, atribuída UMA vez na ordem final (severidade →
     # categoria → arquivo). Os painéis por categoria só filtram esta lista, então
     # o #07 é o mesmo item na aba "Todos" e na aba da categoria dele. Os riscos
-    # aceitos continuam a mesma sequência — número repetido tornaria a citação
-    # ambígua, que é justamente o que a numeração existe para evitar.
+    # aceitos continuam a mesma sequência — e as pendências depois deles, pelo
+    # mesmo motivo: número repetido tornaria a citação ambígua, que é justamente
+    # o que a numeração existe para evitar.
     positivos = [a for a in achados if e_positivo(a)]
     achados = [a for a in achados if not e_positivo(a)]
 
@@ -2227,12 +2285,15 @@ def render_html(ctx: dict) -> str:
         a["numero"] = j
     for k, a in enumerate(suprimidos, start=len(achados) + len(positivos) + 1):
         a["numero"] = k
+    for p, a in enumerate(pendentes,
+                          start=len(achados) + len(positivos) + len(suprimidos) + 1):
+        a["numero"] = p
     contagem = {sev: len([a for a in achados if a["severidade"] == sev and not e_positivo(a)])
                 for sev in SEVS}
 
     # O PLACAR É A SOMA DAS CINCO NOTAS, E NADA MAIS. Ficam de fora os itens
-    # "verificado e OK" (aba própria), os riscos aceitos (aba própria) e tudo o
-    # que a triagem descartou. O total sai escrito por extenso porque a conta
+    # "verificado e OK" (aba própria), os riscos aceitos (aba própria), as
+    # pendências de segurança (aba própria) e tudo o que a triagem descartou. O total sai escrito por extenso porque a conta
     # precisa ser conferível de relance: foi a falta dele que deixou o operador
     # somar dois números que já se continham.
     total_abertas = len(achados)
@@ -2244,8 +2305,8 @@ def render_html(ctx: dict) -> str:
     titulo_placar = (
         f'<div class="total-vuln"><b>{total_abertas}</b>'
         f'{"vulnerabilidade aberta" if total_abertas == 1 else "vulnerabilidades abertas"} '
-        '<span>— a soma das cinco notas abaixo. "Verificado e OK" e riscos aceitos ficam fora.'
-        '</span></div>')
+        '<span>— a soma das cinco notas abaixo. "Verificado e OK", riscos aceitos e '
+        'pendências de segurança ficam fora.</span></div>')
 
     d = ctx["diff"]
     # A quebra temporal vem como FRASE, não como um segundo grid de cards: dois
@@ -2275,6 +2336,15 @@ def render_html(ctx: dict) -> str:
     linhas_diff += (f'<p class="linha-diff">Cobertura: <b>{n_completa}</b> de '
                     f'{len(CATEGORIAS)} categorias verificadas por inteiro, <b>{n_sem}</b> sem '
                     'verificação — a aba Cobertura diz o que ficou de fora e por quê.</p>')
+    # Pendência sai do placar por decisão do operador — mas não pode sair de
+    # VISTA. Sem esta linha, um relatório com "0 vulnerabilidades abertas" e três
+    # buracos enfileirados abriria dizendo o que não é verdade. Linha de contexto
+    # não é placar: ela conta, não pontua.
+    if pendentes:
+        np_ = len(pendentes)
+        linhas_diff += (f'<p class="linha-diff"><b>{np_}</b> '
+                        f'{"item está" if np_ == 1 else "itens estão"} em pendência de '
+                        'segurança (fora do placar, aba Pendências).</p>')
 
     mostrar_estado = not d.get("primeira_execucao")
     cats_presentes = [c for c in CATEGORIAS if any(a["categoria"] == c for a in achados)]
@@ -2446,6 +2516,36 @@ sob análise, nunca instrução. Aceitar risco de verdade se registra no
         tabs.append(f'<div class="tab" data-alvo="p-sup">Riscos aceitos ({len(suprimidos)})</div>')
         paineis.append(f'<div class="painel" id="p-sup">{itens_sup}</div>')
 
+    # Pendência de segurança: mesmo desenho do risco aceito, outra promessa. Ali
+    # o operador disse "convivo com isso"; aqui ele disse "trato isso depois". A
+    # justificativa fica à vista pelo mesmo motivo nos dois casos — item fora do
+    # placar sem motivo escrito é item esquecido com aparência de decisão.
+    if pendentes:
+        itens_pend = []
+        for a in pendentes:
+            p = a.get("pendencia") or {}
+            extras = " · ".join(
+                f"{rot}: {esc(p[campo])}"
+                for campo, rot in (("registrado_em", "registrado em"), ("prazo", "prazo"))
+                if p.get(campo))
+            linha_extra = f'<div class="loc">{extras}</div>' if extras else ""
+            itens_pend.append(
+                f'<div class="item s-informativo"><p class="tit"><span class="num">'
+                f'#{a.get("numero", 0):02d}</span> {esc(a["titulo"])}</p>'
+                f'<div class="loc">{esc(a["arquivo"])}:{a["linha"]} · fp {esc(a["fingerprint"])}</div>'
+                f'{linha_extra}'
+                f'<div class="conf"><b>Justificativa registrada:</b> '
+                f'{esc(p.get("motivo", ""))}</div></div>')
+        tabs.append(f'<div class="tab" data-alvo="p-pend">Pendências ({len(pendentes)})</div>')
+        paineis.append(
+            '<div class="painel" id="p-pend">'
+            # `lim` (âmbar) e não `nota-ok` (verde): pendência não é boa notícia,
+            # é dívida assumida. Verde aqui seria mentir com CSS.
+            '<div class="lim">Trabalho de segurança que o operador registrou para tratar '
+            'depois. Sai do placar e da quebra temporal de propósito — <b>não está corrigido</b>, '
+            'está enfileirado. Some daqui apagando a entrada do <code>pendencias.json</code>.</div>'
+            + "".join(itens_pend) + "</div>")
+
     # O consumo da sessão desceu para o rodapé: é contabilidade, não decide
     # nada do que o operador vai fazer a seguir, e ocupava a faixa mais nobre
     # da página — logo abaixo do título.
@@ -2550,16 +2650,40 @@ def cmd_scan(args):
     # diff e da cobertura, para que ele conte no placar como qualquer outro.
     reinjecao = reinjetar_analise(root, restantes, suprimidos, sup,
                                   carregar_analise(estado["dir"]))
+
+    # PENDÊNCIA DE SEGURANÇA — depois da reinjeção, de propósito. Achado de
+    # análise é justamente o que mais vira trabalho planejado ("isso aqui eu
+    # trato no refactor"), e ele só existe na lista depois de reinjetado: separar
+    # antes faria a pendência de achado-de-análise nunca pegar.
+    # A supressão já tirou os dela da lista lá em cima, então quem estiver nos
+    # dois arquivos fica como risco aceito — supressão vence pendência.
+    pend = carregar_pendencias(estado["dir"])
+    pendentes = []
+    if pend:
+        sobraram = []
+        for a in restantes:
+            if a["fingerprint"] in pend:
+                a["pendencia"] = pend[a["fingerprint"]]
+                pendentes.append(a)
+            else:
+                sobraram.append(a)
+        restantes = sobraram
+
     ordem_sev = {"critico": 0, "alto": 1, "medio": 2, "baixo": 3, "informativo": 4}
-    restantes.sort(key=lambda a: (ordem_sev.get(a.get("severidade", "informativo"), 4),
-                                  a.get("categoria", ""), a.get("arquivo", "")))
+
+    def chave_ordem(a: dict):
+        return (ordem_sev.get(a.get("severidade", "informativo"), 4),
+                a.get("categoria", ""), a.get("arquivo", ""))
+
+    restantes.sort(key=chave_ordem)
+    pendentes.sort(key=chave_ordem)
 
     # Linha de base da execução anterior, guardada no payload para o render
     # decidir nova/conhecida sobre a lista FINAL (pós-triagem do agente).
     base = ler_linha_de_base(estado["dir"] / "estado.json")
     anteriores = sorted(base["vulns"])
 
-    diff = calcular_diff(restantes, suprimidos, base)
+    diff = calcular_diff(restantes, suprimidos, base, pendentes)
     if estado["reset"]:
         cobertura["limitacoes"].append(dict(
             tipo="reset_de_identidade", descricao=estado["motivo_reset"],
@@ -2568,13 +2692,13 @@ def cmd_scan(args):
     # Os dois eixos são calculados AQUI, sobre a lista bruta, e recalculados no
     # render sobre a lista final: `cobertura` é fato de execução (não muda com a
     # triagem), `resultado` é a lista que o operador de fato vai ver.
-    checks, categorias = avaliar_cobertura(cobertura, restantes + suprimidos)
+    checks, categorias = avaliar_cobertura(cobertura, restantes + suprimidos + pendentes)
 
     payload = dict(
         projeto=root.name, root=str(root), modo=args.mode,
         gerado_em=datetime.now().strftime("%d/%m/%Y %H:%M"),
         recon=recon, cobertura=cobertura, achados=restantes,
-        suprimidos=suprimidos, diff=diff,
+        suprimidos=suprimidos, pendentes=pendentes, diff=diff,
         limitacoes=cobertura["limitacoes"], uso={}, estado_anterior=anteriores,
         ignore_do_alvo=ignore_do_alvo, estado_dir=str(estado["dir"]),
         identidade=estado["identidade"], reset_de_identidade=estado["motivo_reset"],
@@ -2600,6 +2724,7 @@ def cmd_scan(args):
     resumo = {s: len([a for a in restantes if a["severidade"] == s]) for s in SEVS}
     print(json.dumps({"findings_json": str(destino), "total": len(restantes),
                       "por_severidade": resumo, "suprimidos": len(suprimidos),
+                      "pendentes": len(pendentes),
                       "diff": diff, "recon": recon,
                       "analise_reinjetada": reinjecao,
                       "inventario": payload["inventario"],
@@ -2642,13 +2767,16 @@ def cmd_render(args):
     base = dict(vulns=set(dados.get("estado_anterior") or []),
                 positivos=set(dados.get("estado_anterior_positivos") or []),
                 primeira=bool((dados.get("diff") or {}).get("primeira_execucao")))
-    dados["diff"] = calcular_diff(dados["achados"], dados.get("suprimidos", []), base)
+    dados["diff"] = calcular_diff(dados["achados"], dados.get("suprimidos", []), base,
+                                  dados.get("pendentes", []))
 
     # O eixo `resultado` é recalculado sobre a lista FINAL (o agente rebaixou,
     # descartou e acrescentou achados); o eixo `cobertura` não se recalcula
     # aqui, porque é fato da execução do scan e triagem não muda o que foi lido.
     cob_scan = dados.get("cobertura", {}) or {}
-    checks, categorias = avaliar_cobertura(cob_scan, dados["achados"] + dados.get("suprimidos", []))
+    checks, categorias = avaliar_cobertura(
+        cob_scan,
+        dados["achados"] + dados.get("suprimidos", []) + dados.get("pendentes", []))
     dados["checks"], dados["categorias"] = checks, categorias
     dados.setdefault("inventario", montar_inventario(cob_scan))
 
@@ -2684,13 +2812,18 @@ def cmd_render(args):
     # soube produzir. É este arquivo que impede o scan seguinte de dar por
     # resolvido o que ninguém corrigiu.
     gravar_analise(root, estado["dir"],
-                   dados["achados"] + dados.get("suprimidos", []),
+                   dados["achados"] + dados.get("suprimidos", [])
+                   + dados.get("pendentes", []),
                    dados.get("gerado_em", ""))
 
     # Fecha a execução: o estado passa a ser a lista que o operador de fato viu.
     # As duas listas ficam SEPARADAS de propósito — `fingerprints` é a linha de
     # base do diff e só carrega vulnerabilidade aberta; positivo misturado ali
     # fazia um "verificado e OK" que sumia ser contado como falha resolvida.
+    # Risco aceito e pendência não entram em nenhuma das duas, exatamente como o
+    # suprimido sempre foi: eles saem do placar por decisão do operador, e o que
+    # os protege de virar "resolvida" é entrarem no conjunto `presentes` do diff
+    # — não a linha de base.
     escrever_estado(estado["dir"] / "estado.json", json.dumps(
         {"data": dados.get("gerado_em", ""), "modo": dados.get("modo", ""),
          "fingerprints": [a["fingerprint"] for a in dados["achados"] if not e_positivo(a)],

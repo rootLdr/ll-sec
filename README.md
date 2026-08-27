@@ -122,6 +122,15 @@ dentro do estado do auditor, e a skill nunca escreve nesse arquivo. O item
 suprimido também não desaparece: vai para a aba "Riscos aceitos", com a
 justificativa à vista.
 
+Melhoria que já está na fila tem lugar próprio. O `pendencias.json`, ao lado da
+supressão, guarda o que o operador decidiu tratar depois: o item sai do placar e
+da quebra temporal, vai para a aba "Pendências" com a justificativa (e, se
+houver, data de registro e prazo), e uma linha discreta abaixo do placar diz
+quantos são, para que nenhuma pendência fique invisível. Mover para pendência
+não é resolver — o diff nunca conta isso como corrigido. Fingerprint que estiver
+nos dois arquivos vale como risco aceito: supressão vence pendência. A skill só
+escreve aí quando o operador pede.
+
 Achado inventado sai mais caro que achado nenhum. Todo achado crítico ou alto
 passa por triagem manual, que pergunta se a entrada é controlada pelo usuário,
 se aquilo roda no cliente ou no servidor, e se existe defesa em outra camada.
@@ -157,6 +166,7 @@ devolve o comportamento antigo, de forma explícita.
 ├── triagem.json         memória de triagem, escrito pelo render
 ├── analise.json         achados de análise inteiros, apagados à mão
 ├── supressoes.json      riscos aceitos, escrito por você e nunca pela skill
+├── pendencias.json      pendências de segurança, escritas só a pedido do operador
 └── relatorios/          findings.json e os HTML
 
 <repositório auditado>/  nada. Nenhum byte.
