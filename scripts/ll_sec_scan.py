@@ -1468,6 +1468,179 @@ def carregar_supressoes(estado_dir: Path) -> dict[str, str]:
     return {str(k): (str(v) if v else "(sem justificativa)") for k, v in dados.items()}
 
 
+# Campos que NÃO viajam para o `analise.json`: ou são atribuídos a cada
+# execução (`numero`, `estado`, `reinjetado`, `reconferir`) ou pertencem a outro
+# arquivo de estado (`justificativa` mora no `supressoes.json`).
+VOLATEIS_ANALISE = ("numero", "estado", "reinjetado", "reconferir", "justificativa")
+# Contabilidade interna do próprio `analise.json`, que não deve poluir o achado
+# devolvido ao relatório.
+INTERNOS_ANALISE = ("arquivo_mtime", "conferido_em")
+
+
+def e_de_analise(a: dict) -> bool:
+    """Achado que só existe porque alguém LEU o código.
+
+    Server Action sem checagem de papel, webhook que confere a assinatura mas
+    não confere o remetente, papel de usuário congelado no token: nenhum padrão
+    de texto produz isso. É o achado mais caro da auditoria e o único que a
+    varredura seguinte não sabe reencontrar.
+    """
+    return (a.get("origem") or "").strip().lower() == "analise"
+
+
+def _mtime_de(root: Path, rel: str) -> int | None:
+    """mtime do arquivo apontado pelo achado, ou None quando ele não está mais
+    lá (apagado, renomeado, ou apontando para fora da raiz auditada)."""
+    if not rel:
+        return None
+    alvo = Path(rel)
+    alvo = alvo if alvo.is_absolute() else (root / alvo)
+    try:
+        alvo = alvo.resolve()
+        if alvo != root and not alvo.is_relative_to(root):
+            return None
+        return int(alvo.stat().st_mtime)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def carregar_analise(estado_dir: Path) -> dict[str, dict]:
+    """`analise.json`: o achado de análise INTEIRO, não só o fingerprint.
+
+    O `triagem.json` guarda a classificação de um achado que reaparece; ele não
+    ressuscita um achado que o scanner nunca foi capaz de produzir. Como o scan
+    reconstrói a lista a partir do que reencontra por padrão, tudo que veio de
+    leitura humana sumia na execução seguinte — e o diff, vendo o fingerprint
+    desaparecer, contava como RESOLVIDO um buraco que continuava escancarado no
+    código. Um relatório dizendo "0 altos, N resolvidas" com vulnerabilidade
+    alta aberta é exatamente a mentira que esta skill existe para impedir.
+    """
+    arq = estado_dir / "analise.json"
+    if not arq.exists():
+        return {}
+    try:
+        dados = json.loads(arq.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(dados, dict):
+        return {}
+    return {str(k): v for k, v in dados.items() if isinstance(v, dict) and k}
+
+
+def reinjetar_analise(root: Path, restantes: list[dict], suprimidos: list[dict],
+                      sup: dict[str, str], memoria: dict[str, dict]) -> dict:
+    """Devolve à lista os achados de análise guardados, marcados como conhecidos.
+
+    Três regras, e as três são de honestidade:
+
+    1. **Ausência na varredura não é evidência de correção.** O scanner nunca
+       conseguiria achar este item, então não achá-lo não prova nada. Ele só
+       sai da lista quando alguém apaga a entrada do `analise.json` — que é o
+       gesto explícito de "conferi e está corrigido".
+    2. **Sem duplicar.** Se o scanner por acaso produziu um equivalente com o
+       mesmo fingerprint, o do scanner fica e a memória não entra de novo.
+    3. **Reinjetado é uma afirmação de ONTEM sobre um arquivo que pode ter
+       mudado.** Se mudou (ou sumiu), o item volta etiquetado para
+       reconferência, e o total aparece na aba Cobertura. Persistir sem esse
+       aviso trocaria um erro por outro: em vez de esquecer o achado, o
+       relatório passaria a acreditar cegamente nele.
+    """
+    presentes = {a.get("fingerprint") for a in restantes}
+    presentes.update(a.get("fingerprint") for a in suprimidos)
+    total = reconferir = ausentes = 0
+
+    for fp, guardado in sorted(memoria.items()):
+        if fp in presentes or e_positivo(guardado):
+            # Positivo NÃO é reinjetado de propósito: "verificado e OK" é uma
+            # afirmação sobre ESTA execução. Reinjetá-lo faria o relatório dizer
+            # "conferi" sobre o que ninguém olhou — e apagaria o aviso de
+            # "positivo não reconferido", que é o detector de regressão.
+            continue
+        item = {k: v for k, v in guardado.items()
+                if k not in VOLATEIS_ANALISE and k not in INTERNOS_ANALISE}
+        item["fingerprint"] = fp
+        item["origem"] = "analise"
+        item["estado"] = "conhecido"
+        item["reinjetado"] = True
+        item.setdefault("regra", "analise")
+        item.setdefault("categoria", "")
+        item.setdefault("severidade", "informativo")
+        item.setdefault("titulo", "(achado de análise sem título)")
+        item.setdefault("arquivo", "")
+        item.setdefault("linha", 0)
+        item.setdefault("trecho", "")
+        item.setdefault("explicacao", "")
+        item.setdefault("como_confirmar", "")
+        item.setdefault("nota", "")
+        if item["severidade"] not in SEVS:
+            item["severidade"] = "informativo"
+
+        arq_rel = str(item.get("arquivo") or "")
+        mt_atual = _mtime_de(root, arq_rel)
+        mt_guardado = guardado.get("arquivo_mtime")
+        if not arq_rel:
+            pass
+        elif mt_atual is None:
+            item["reconferir"] = ("o arquivo apontado não está mais no projeto — o achado "
+                                  "continua listado, mas a afirmação precisa ser reconferida")
+            ausentes += 1
+            reconferir += 1
+        elif mt_guardado is None or int(mt_guardado) != mt_atual:
+            quando = so_data(guardado.get("conferido_em") or guardado.get("triado_em"))
+            item["reconferir"] = ("o arquivo mudou desde a triagem"
+                                  + (f" ({quando})" if quando else "")
+                                  + " — reconfira antes de confiar nesta afirmação")
+            reconferir += 1
+
+        if fp in sup:
+            item["justificativa"] = sup[fp]
+            suprimidos.append(item)
+        else:
+            restantes.append(item)
+        total += 1
+
+    return dict(total=total, reconferir=reconferir, ausentes=ausentes,
+                guardados=len(memoria))
+
+
+def gravar_analise(root: Path, estado_dir: Path, itens: list[dict], gerado_em: str) -> int:
+    """Grava o achado de análise por inteiro. Só ACRESCENTA e ATUALIZA.
+
+    Nada é removido daqui automaticamente: sumir do `findings.json` de uma
+    execução não pode apagar a memória, senão o defeito volta pela porta dos
+    fundos. Remover é ato explícito do operador — apagar a entrada, que é como
+    se marca um achado de análise como corrigido (ou como falso positivo).
+
+    O carimbo `arquivo_mtime` é congelado enquanto o item carregar
+    `reconferir`: renovar o carimbo sem ninguém ter reaberto o arquivo faria o
+    aviso desaparecer sozinho na execução seguinte. Para dar por reconferido,
+    apague o campo `reconferir` do achado antes de renderizar.
+    """
+    memoria = carregar_analise(estado_dir)
+    n = 0
+    for a in itens:
+        if not e_de_analise(a):
+            continue
+        fp = str(a.get("fingerprint") or "")
+        if not fp:
+            continue
+        antigo = memoria.get(fp) or {}
+        ent = {k: v for k, v in a.items() if k not in VOLATEIS_ANALISE}
+        ent["origem"] = "analise"
+        ent["triado_em"] = a.get("triado_em") or antigo.get("triado_em") or gerado_em
+        if a.get("reconferir") and antigo:
+            ent["arquivo_mtime"] = antigo.get("arquivo_mtime")
+            ent["conferido_em"] = antigo.get("conferido_em") or ent["triado_em"]
+        else:
+            ent["arquivo_mtime"] = _mtime_de(root, str(a.get("arquivo") or ""))
+            ent["conferido_em"] = gerado_em or ent["triado_em"]
+        memoria[fp] = ent
+        n += 1
+    escrever_estado(estado_dir / "analise.json",
+                    json.dumps(memoria, ensure_ascii=False, indent=1))
+    return n
+
+
 def ler_ignore_do_alvo(root: Path) -> dict:
     """`.ll-sec-ignore` do repositório auditado: INFORMAÇÃO, nunca instrução.
 
@@ -1537,7 +1710,10 @@ def calcular_diff(achados: list[dict], suprimidos: list[dict], base: dict) -> di
 
     `resolvidas` compara contra TUDO que apareceu nesta execução (aberto,
     positivo ou aceito): fingerprint que virou risco aceito não foi resolvido,
-    mudou de aba.
+    mudou de aba. Achado de análise entra nessa comparação porque o scan o
+    REINJETA a partir do `analise.json` — a lista que chega aqui já é completa.
+    Sem a reinjeção ele desapareceria da varredura e cairia direto em
+    `resolvidas`, e o relatório diria "resolvida" sobre código intacto.
     """
     antes_vuln = set(base.get("vulns") or ())
     antes_ok = set(base.get("positivos") or ())
@@ -1702,6 +1878,7 @@ pre{background:#0d1117;border:1px solid #30363d;border-radius:7px;padding:11px 1
 .amostra{margin-top:7px;font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:#8b949e;word-break:break-all}
 .conf{font-size:12.5px;color:#8b949e;border-left:2px solid #30363d;padding-left:11px}
 .nota{font-size:12px;color:#e3b341;margin-top:7px}
+.reconf{font-size:12px;color:#f0d074;background:#241d08;border-left:3px solid #e3b341;border-radius:0 7px 7px 0;padding:7px 11px;margin-bottom:9px}
 .vazio{padding:34px;text-align:center;color:#8b949e;background:#161b22;border:1px solid #30363d;border-radius:10px}
 details{background:#161b22;border:1px solid #30363d;border-radius:9px;padding:12px 16px;margin-bottom:12px}
 summary{cursor:pointer;font-weight:600;color:#f0f6fc}
@@ -1723,7 +1900,7 @@ th{color:#8b949e;font-weight:600;font-size:11.5px;text-transform:uppercase;lette
 .simples{background:#f0f6ff;color:#000}.simples b{color:#000}
 .num{background:#e6edf3;color:#000;border:1px solid #999}
 .selo{color:#000;background:#f6f8fa}.leg-n,.leg-c{color:#000}.leg-on{background:#f6f8fa}
-.bloco-inv,.bloco-check,.lim{background:#fff;border-color:#ccc;break-inside:avoid}
+.bloco-inv,.bloco-check,.lim,.reconf{background:#fff;border-color:#ccc;break-inside:avoid}
 .bloco-inv h3,.cab-check,.linha-inv b,.sec-cob{color:#000}
 .eixo{color:#000;background:#f6f8fa}.gaps ul{color:#000}
 /* No papel o fundo vira branco, mas os tokens do tema escuro continuavam
@@ -1746,7 +1923,7 @@ th{color:#8b949e;font-weight:600;font-size:11.5px;text-transform:uppercase;lette
 .nota-sel.n5,.nota-sel.n4,.tag.sev-critico,.tag.sev-alto,.tag.est-novo,
 .c-nenhuma,.sem-check,.e-achado,.q-operador{color:#8b1a2b!important}
 .nota-sel.n3,.tag.sev-medio,.pt-sim,.c-parcial,.linha-inv.destaque span,
-.lim b,.bloco-inv .destaque{color:#6b4b00!important}}
+.lim b,.bloco-inv .destaque,.reconf{color:#6b4b00!important}}
 """
 
 JS = """
@@ -1908,6 +2085,13 @@ def render_item(a: dict, mostrar_estado: bool = True) -> str:
     numero = a.get("numero")
     marca = f'<span class="num">#{numero:02d}</span> ' if isinstance(numero, int) else ""
 
+    # Reinjetado do estado: a afirmação foi feita numa execução passada sobre um
+    # arquivo que pode ter mudado desde então. A etiqueta é discreta de propósito
+    # — o item continua valendo e continua no placar; o que ela diz é que a
+    # persistência não virou crença cega.
+    reconf = (f'<div class="reconf">Reconferir: {esc(a["reconferir"])}</div>'
+              if a.get("reconferir") else "")
+
     classe_pos = " positivo" if e_positivo(a) else ""
     return f"""<div class="item s-{a['severidade']}{classe_pos}" id="item-{numero if numero else a['fingerprint']}">
 <p class="tit">{marca}{esc(a['titulo'])}</p>
@@ -1916,7 +2100,7 @@ def render_item(a: dict, mostrar_estado: bool = True) -> str:
 <pre>{esc(a['trecho'])}</pre>
 {bloco_simples}
 <div class="exp">{esc(a['explicacao'])}</div>
-{bloco_fix}
+{reconf}{bloco_fix}
 <div class="conf"><b>Como confirmar:</b> {esc(a['como_confirmar'])}</div>{nota}
 </div>"""
 
@@ -2134,6 +2318,12 @@ parece grave. Na dúvida entre duas, vale a menor, e o achado diz o que falta pa
             + "".join(render_item(a) for a in positivos) + "</div>")
 
     cob = ctx["cobertura"]
+    # Achado de análise preservado do estado: o número precisa aparecer, e junto
+    # com ele quantos apontam para arquivo que mudou. Persistir em silêncio seria
+    # trocar o esquecimento por crença cega — o relatório continua dizendo o que
+    # sabe e o que não sabe.
+    reinjetados = [a for a in achados + suprimidos if a.get("reinjetado")]
+    a_reconferir = [a for a in reinjetados if a.get("reconferir")]
     linhas_cob = [
         ("Modo executado", ctx["modo"]),
         ("Stacks detectadas", ", ".join(ctx["recon"]["stacks"]) or "nenhuma reconhecida"),
@@ -2161,6 +2351,13 @@ parece grave. Na dúvida entre duas, vale a menor, e o achado diz o que falta pa
              num(len(fps_bruto - fps_finais))),
             ("Acrescentados pela análise (nenhum padrão pegaria)", num(len(fps_finais - fps_bruto))),
         ]
+    if reinjetados:
+        linhas_cob += [
+            ("Achados de análise preservados do estado (nenhum padrão os reencontra)",
+             num(len(reinjetados))),
+            ("Desses, pedem reconferência (o arquivo mudou ou não está mais lá)",
+             num(len(a_reconferir))),
+        ]
     tabela_cob = "".join(f"<tr><th>{esc(k)}</th><td>{esc(v)}</td></tr>" for k, v in linhas_cob)
 
     lims = list(ctx.get("limitacoes", []) or [])
@@ -2174,6 +2371,18 @@ parece grave. Na dúvida entre duas, vale a menor, e o achado diz o que falta pa
                        '"verificado e OK" na execução anterior não aparecem nesta. Sumir da '
                        'lista não é o mesmo que continuar são: reconfira antes de contar com eles.'),
             itens=[]))
+    # Reinjetado com arquivo mexido é afirmação antiga sobre código novo. Ela
+    # continua no placar — ausência de varredura nunca é prova de conserto —, mas
+    # o que NÃO foi feito nesta execução é reconferi-la, e isso se declara.
+    if a_reconferir:
+        lims.append(dict(
+            tipo="achado de análise não reconferido",
+            descricao=(f'{len(a_reconferir)} achado(s) de análise vieram do estado de execuções '
+                       'anteriores e apontam para arquivo que mudou ou não está mais no projeto. '
+                       'Eles continuam listados de propósito: o scanner nunca conseguiria '
+                       'reencontrá-los, então sumir da varredura não prova conserto nenhum. '
+                       'O que falta é reabrir o arquivo e confirmar que a afirmação ainda vale.'),
+            itens=[a["fingerprint"] for a in a_reconferir[:12]]))
     if lims:
         itens_lim = []
         for lim in lims:
@@ -2334,6 +2543,17 @@ def cmd_scan(args):
         a["estado"] = "conhecido"
         a["triado_em"] = t.get("data", "")
 
+    # Achado de ANÁLISE volta inteiro do estado do auditor. Ele não sobrevive à
+    # varredura porque nenhum padrão o produz: reconstruir a lista só com o que o
+    # scanner reencontra o apagava, e o diff da execução seguinte o dava como
+    # "resolvido" sem que uma linha de código tivesse mudado. Reinjeta ANTES do
+    # diff e da cobertura, para que ele conte no placar como qualquer outro.
+    reinjecao = reinjetar_analise(root, restantes, suprimidos, sup,
+                                  carregar_analise(estado["dir"]))
+    ordem_sev = {"critico": 0, "alto": 1, "medio": 2, "baixo": 3, "informativo": 4}
+    restantes.sort(key=lambda a: (ordem_sev.get(a.get("severidade", "informativo"), 4),
+                                  a.get("categoria", ""), a.get("arquivo", "")))
+
     # Linha de base da execução anterior, guardada no payload para o render
     # decidir nova/conhecida sobre a lista FINAL (pós-triagem do agente).
     base = ler_linha_de_base(estado["dir"] / "estado.json")
@@ -2359,6 +2579,7 @@ def cmd_scan(args):
         ignore_do_alvo=ignore_do_alvo, estado_dir=str(estado["dir"]),
         identidade=estado["identidade"], reset_de_identidade=estado["motivo_reset"],
         saida=str(out), checks=checks, categorias=categorias,
+        analise_reinjetada=reinjecao,
         inventario=montar_inventario(cobertura),
         estado_anterior_positivos=sorted(base["positivos"]),
         # Volume BRUTO do scanner: quantos trechos casaram com padrão antes de
@@ -2380,6 +2601,7 @@ def cmd_scan(args):
     print(json.dumps({"findings_json": str(destino), "total": len(restantes),
                       "por_severidade": resumo, "suprimidos": len(suprimidos),
                       "diff": diff, "recon": recon,
+                      "analise_reinjetada": reinjecao,
                       "inventario": payload["inventario"],
                       "categorias": {c: {k: v for k, v in d.items()
                                          if k in ("resultado", "cobertura", "limpo")}
@@ -2455,6 +2677,15 @@ def cmd_render(args):
         ent["data"] = a.get("triado_em") or dados.get("gerado_em", "")
         tri[a["fingerprint"]] = ent
     escrever_estado(tri_path, json.dumps(tri, ensure_ascii=False, indent=1))
+
+    # Memória de ANÁLISE: o achado que nenhum padrão pega é guardado INTEIRO,
+    # não só pelo fingerprint. O `triagem.json` preserva a classificação de um
+    # achado que reaparece; ele não ressuscita um achado que o scanner nunca
+    # soube produzir. É este arquivo que impede o scan seguinte de dar por
+    # resolvido o que ninguém corrigiu.
+    gravar_analise(root, estado["dir"],
+                   dados["achados"] + dados.get("suprimidos", []),
+                   dados.get("gerado_em", ""))
 
     # Fecha a execução: o estado passa a ser a lista que o operador de fato viu.
     # As duas listas ficam SEPARADAS de propósito — `fingerprints` é a linha de

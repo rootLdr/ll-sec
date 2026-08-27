@@ -155,6 +155,7 @@ devolve o comportamento antigo, de forma explícita.
 ├── identidade.json      identidade física do repositório (não editar)
 ├── estado.json          linha de base do diff, escrito pelo render
 ├── triagem.json         memória de triagem, escrito pelo render
+├── analise.json         achados de análise inteiros, apagados à mão
 ├── supressoes.json      riscos aceitos, escrito por você e nunca pela skill
 └── relatorios/          findings.json e os HTML
 
@@ -171,6 +172,13 @@ auditados na máquina, por isso nasce com permissão restrita.
 - Memória de triagem: a classificação dada a um achado fica gravada. Na execução
   seguinte ele entra como conhecido em vez de novo, e é revisto se o arquivo
   dele mudou.
+- Memória de análise: o achado que nenhum padrão pega, o que existe só porque
+  alguém leu o código, fica gravado inteiro e volta sozinho na execução
+  seguinte, marcado como conhecido. Ele nunca é dado como resolvido por
+  ausência, porque nenhuma varredura conseguiria reencontrá-lo. Sai da lista
+  quando você apaga a entrada dele, e é assim que se marca um achado desses
+  como corrigido. Se o arquivo mudou desde a triagem, ele volta pedindo
+  reconferência.
 - Identidade física: junto do estado ficam gravados o caminho canônico e o
   `dev`/`ino` da raiz e do `.git`. Se o projeto foi movido, reclonado ou
   substituído no mesmo caminho, o estado anterior é arquivado e a execução

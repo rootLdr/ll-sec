@@ -145,6 +145,24 @@ adicionando objetos com os mesmos campos e `"origem": "analise"`. Gere o
 fingerprint com `sha256(regra + caminho + trecho normalizado)[:16]` para que o
 diff funcione na próxima execução.
 
+**Esse achado é guardado por inteiro e volta sozinho na execução seguinte.** Ele
+vai para o `analise.json` do estado do auditor com todos os campos, e o `scan`
+seguinte o reinjeta na lista, marcado como *conhecido*. Não é conveniência: é
+correção de uma mentira. O `scan` reconstrói a lista com o que o scanner
+reencontra por padrão, e o `triagem.json` preserva a *classificação* de um
+achado que reaparece — nenhum dos dois ressuscita um achado que o scanner nunca
+foi capaz de produzir. Sem a reinjeção, tudo que veio de leitura humana sumia do
+relatório e o diff, vendo o fingerprint desaparecer, contava como **resolvido**
+um buraco intacto no código.
+
+**Achado de análise nunca vira "resolvida" por ausência.** Não encontrá-lo numa
+varredura não prova nada, porque nenhuma varredura conseguiria encontrá-lo. Ele
+sai da lista por um gesto explícito e só por ele: **apagar a entrada dele no
+`analise.json`** — que é como você o marca como corrigido, ou como falso
+positivo que decidiu descartar. É o mesmo espírito de apagar a entrada do
+`triagem.json` para forçar re-triagem. Some do `findings.json` de uma execução
+não apaga nada: a memória só cresce, e encolher é ato do operador.
+
 #### Três campos que você preenche em cada achado que sobreviveu
 
 O relatório é lido por quem opera o sistema, não por quem escreveu o código. Todo
@@ -207,6 +225,13 @@ merece: *candidatos analisados* (trechos que casaram com algum padrão),
 *descartados na triagem* e *acrescentados pela análise*. Esses três números
 medem o esforço da varredura — **nenhum deles é contagem de vulnerabilidade**,
 e é por isso que ficam longe do placar.
+
+Quando a execução reinjeta achados de análise, duas linhas a mais aparecem ali:
+**quantos vieram do estado** e **quantos pedem reconferência** — o arquivo deles
+mudou, ou não está mais no projeto, desde o dia da triagem. Esses itens seguem
+no placar (ausência de varredura não é prova de conserto), mas o que a execução
+*não* fez foi reabrir o arquivo, e isso sai declarado em "O que esta execução
+NÃO fez".
 
 Ao fechar, **leia esse painel antes de dizer que está tudo certo**. O número que
 mais importa ali é *não reconhecidos*: são arquivos do projeto cujo tipo o
@@ -423,6 +448,32 @@ nessa contagem.
   mudou** desde a data gravada. Para forçar re-triagem de um item, apague a
   entrada dele no `triagem.json`. O arquivo vive no estado do auditor, fora do
   repositório, e é atualizado a cada render.
+- **Memória de análise** em `~/.local/state/ll-sec/<repo-id>/analise.json`: o
+  render grava ali, **inteiro**, todo achado com `"origem": "analise"` — todos
+  os campos, não só o fingerprint —, mais a data da triagem e o `mtime` do
+  arquivo naquele momento. O scan seguinte reinjeta cada um na lista, pelo
+  fingerprint, marcado como *conhecido*, sem duplicar caso o scanner por acaso
+  tenha produzido um equivalente. **Um achado de análise nunca é dado como
+  resolvido automaticamente**: ausência na varredura não é evidência de
+  correção, porque o scanner nunca conseguiria achá-lo. Para **marcá-lo como
+  corrigido** — ou descartá-lo como falso positivo — apague a entrada dele
+  nesse arquivo; é o único jeito de ele sair da lista, e a partir daí o diff o
+  conta como resolvido normalmente.
+- **Reinjetado vem com data, e é reconferido quando o arquivo muda.** Um achado
+  de análise que volta é uma afirmação feita numa execução passada sobre um
+  arquivo que pode ter mudado desde então. Se o `mtime` do arquivo divergir do
+  gravado, ou se o arquivo não estiver mais lá, o item volta com a etiqueta
+  **"reconferir"** no cartão e entra na contagem da aba Cobertura. Ele continua
+  valendo e continua no placar — o que a etiqueta diz é que a persistência não
+  virou crença cega. Reabra o arquivo, confirme que a afirmação ainda vale e
+  **apague o campo `reconferir` do achado** antes de renderizar: enquanto ele
+  estiver lá, o carimbo antigo fica congelado e o aviso reaparece.
+- **Positivo de análise não é reinjetado**, de propósito. "Verificado e OK" é
+  afirmação sobre **esta** execução; devolvê-lo sozinho faria o relatório dizer
+  "conferi" sobre o que ninguém olhou e apagaria o aviso de *positivo não
+  reconferido*, que é o detector de regressão. Ele fica guardado no
+  `analise.json` para consulta, mas quem o traz de volta para a lista é você,
+  reconferindo.
 - **"Conhecido" significa "já triado antes" — e só isso.** Não significa
   resolvido, não significa aceito e **não tira o item do placar**: ele continua
   contando como vulnerabilidade aberta, com a etiqueta "conhecida desde
@@ -463,6 +514,7 @@ segredo. Se você acrescentar um achado com segredo à mão, masque também.
 ├── identidade.json      identidade física do repositório (não editar)
 ├── estado.json          linha de base do diff (vulns + positivos) — escrito pelo render
 ├── triagem.json         memória de triagem — escrito pelo render
+├── analise.json         achados de análise INTEIROS — escrito pelo render, apagado à mão
 ├── supressoes.json      riscos aceitos — escrito por VOCÊ, nunca pela skill
 └── relatorios/          findings.json + os HTML
 <repositório auditado>/  nada. Nenhum byte.
@@ -471,8 +523,8 @@ segredo. Se você acrescentar um achado com segredo à mão, masque também.
 A última linha é literal e não é negociável, nem "só um markdown com os achados
 conhecidos, para não esquecer". Esse arquivo seria um mapa de ataque versionado,
 que sobe para o remoto junto com o próximo commit — e a memória entre execuções
-que ele tentaria criar já existe inteira aqui, no `triagem.json` e no
-`estado.json`, do lado de fora.
+que ele tentaria criar já existe inteira aqui, no `triagem.json`, no
+`analise.json` e no `estado.json`, do lado de fora.
 
 Esse diretório concentra o mapa de vulnerabilidade de **todos** os projetos da
 máquina: `0700`/`0600` é o mínimo, e ele não deve entrar em backup sincronizado
