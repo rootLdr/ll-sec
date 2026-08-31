@@ -1802,6 +1802,46 @@ def calcular_diff(achados: list[dict], suprimidos: list[dict], base: dict,
 # contrato "somente leitura", cuja própria docstring admitia ser exceção.
 
 
+# Chrome do agent-browser, já instalado na máquina — impressão do próprio HTML
+# via --print-to-pdf, sem lib Python nova (reportlab/weasyprint recriariam o
+# layout numa engine diferente da que gerou o HTML; imprimir o mesmo documento
+# garante que os dois nunca divergem).
+CHROME_BIN = Path.home() / ".agent-browser/browsers/chrome-152.0.7977.42/chrome"
+
+
+def gerar_pdf(html_path: Path) -> dict:
+    """Imprime o HTML já gravado em PDF, ao lado dele, mesmo nome. Falha do
+    Chrome headless não derruba a execução — o HTML já está no disco e é o
+    fallback; aqui só se reporta o que deu errado."""
+    pdf_path = html_path.with_suffix(".pdf")
+    if not CHROME_BIN.exists():
+        return dict(gerado=False, caminho=None,
+                    motivo=f"Chrome headless não encontrado em {CHROME_BIN}")
+    cmd = [str(CHROME_BIN), "--headless", "--disable-gpu", "--no-sandbox",
+           "--disable-dev-shm-usage", f"--print-to-pdf={pdf_path}",
+           "--no-pdf-header-footer", f"file://{html_path.resolve()}"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=90, text=True)
+    except Exception as e:
+        return dict(gerado=False, caminho=None,
+                    motivo=f"falha ao executar o Chrome headless: {e}")
+    if r.returncode != 0:
+        return dict(gerado=False, caminho=None,
+                    motivo=f"Chrome headless saiu com código {r.returncode}: "
+                           f"{(r.stderr or '').strip()[-500:]}")
+    if not pdf_path.exists() or pdf_path.stat().st_size == 0:
+        return dict(gerado=False, caminho=None,
+                    motivo="Chrome headless não gravou PDF (arquivo ausente ou vazio)")
+    with pdf_path.open("rb") as fh:
+        assinatura = fh.read(5)
+    if assinatura != b"%PDF-":
+        return dict(gerado=False, caminho=None,
+                    motivo="arquivo gravado não começa com a assinatura %PDF- "
+                           "(saída corrompida)")
+    os.chmod(pdf_path, 0o600)
+    return dict(gerado=True, caminho=str(pdf_path), bytes=pdf_path.stat().st_size)
+
+
 def resolver_saida(root: Path, out_arg: str | None, estado: dict) -> Path:
     """Onde o relatório é gravado. Dentro da raiz auditada é ERRO, não opção.
 
@@ -1943,6 +1983,20 @@ summary{cursor:pointer;font-weight:600;color:#f0f6fc}
 table{width:100%;border-collapse:collapse;font-size:13px}
 td,th{padding:7px 10px;border-bottom:1px solid #21262d;text-align:left}
 th{color:#8b949e;font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.5px}
+.plano{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px 20px;margin-bottom:22px}
+.plano h2{font-size:15px;margin:0 0 12px;color:#f0f6fc}
+.plano-grupo{margin-bottom:12px}.plano-grupo:last-child{margin-bottom:0}
+.plano-grupo h3{font-size:13px;margin:0 0 7px;color:#f0f6fc;font-weight:600;display:flex;align-items:center;gap:8px}
+.plano-n{color:#8b949e;font-weight:400;font-size:12px}
+.plano-selo{font-size:11px;font-weight:700;padding:2px 8px;border-radius:20px;border:1px solid}
+.plano-selo.p1{background:#3d1418;border-color:#ff7b72;color:#ff9f96}
+.plano-selo.p2{background:#332b0f;border-color:#e3b341;color:#f0d074}
+.plano-selo.p3{background:#0d2d4d;border-color:#79c0ff;color:#a5d6ff}
+.plano ul{margin:0;padding-left:20px}
+.plano li{font-size:13px;margin-bottom:4px;color:#c9d1d9}
+.plano a{color:#79c0ff;text-decoration:none}
+.plano a:hover{text-decoration:underline}
+.plano-cat{color:#8b949e;font-size:12px}
 @media (max-width:760px){
 .wrap{padding:20px 12px 60px}
 .leg-n{white-space:normal}
@@ -1950,8 +2004,15 @@ th{color:#8b949e;font-weight:600;font-size:11.5px;text-transform:uppercase;lette
 .tab-leg td{font-size:12px}
 .leg-m{width:auto}
 }
-@media print{body{background:#fff;color:#000}.tab{display:none}.painel{display:block!important}
+@media print{
+@page{size:A4;margin:2cm}
+body{background:#fff;color:#000}.tab{display:none}.painel{display:block!important}
+/* Cada painel por categoria repete os mesmos itens que já aparecem em "Todos" —
+   sem isso o PDF sairia com o relatório inteiro duplicado uma vez por categoria. */
+.painel-cat{display:none!important}
+.tabs{display:none}
 .item,.card,.meta,details{background:#fff;border-color:#ccc;break-inside:avoid}
+.plano,.plano-grupo{break-inside:avoid}
 .tit,h1{color:#000}pre{background:#f6f8fa;color:#000}
 .simples{background:#f0f6ff;color:#000}.simples b{color:#000}
 .num{background:#e6edf3;color:#000;border:1px solid #999}
@@ -1969,6 +2030,7 @@ th{color:#8b949e;font-weight:600;font-size:11.5px;text-transform:uppercase;lette
 .num,.tag,.nota-sel,.selo,.eixo,.aviso,.lim,.card,.meta,.amostra,
 .q-agente,.q-operador,.q-ambos,.q-nenhuma,.pt-sim,.pt-nao,.e-limpo,
 .e-achado,.e-nada,.c-completa,.c-parcial,.c-nenhuma,.c-na,.nota-ok,
+.plano,.plano-selo,
 .linha-inv.destaque{background:#f6f8fa!important;border-color:#8c959f!important}
 .sub,.card .l,.tag,.q-nenhuma,.pt-nao,.leg-rod,.e-nada,.sub-inv,.just,
 .ver-cap,.gaps summary,.nota-sel.n1,.tag.nota-sel.n1{color:#4b535d!important}
@@ -1977,9 +2039,10 @@ th{color:#8b949e;font-weight:600;font-size:11.5px;text-transform:uppercase;lette
 .tab-ok,.item.positivo,.q-agente,.e-limpo,.c-completa,
 .linha-diff.ok,.linha-diff.ok b{color:#0f5323!important}
 .nota-sel.n5,.nota-sel.n4,.tag.sev-critico,.tag.sev-alto,.tag.est-novo,
-.c-nenhuma,.sem-check,.e-achado,.q-operador{color:#8b1a2b!important}
+.c-nenhuma,.sem-check,.e-achado,.q-operador,.plano-selo.p1{color:#8b1a2b!important}
 .nota-sel.n3,.tag.sev-medio,.pt-sim,.c-parcial,.linha-inv.destaque span,
-.lim b,.bloco-inv .destaque,.reconf{color:#6b4b00!important}}
+.lim b,.bloco-inv .destaque,.reconf,.plano-selo.p2{color:#6b4b00!important}
+.plano-selo.p3{color:#0550ae!important}}
 """
 
 JS = """
@@ -2265,6 +2328,43 @@ def render_checks(ctx: dict) -> str:
     return "".join(blocos)
 
 
+PLANO_BALDES = {
+    "P1": ("Resolva antes de qualquer deploy", "p1", ("critico", "alto")),
+    "P2": ("Resolva no próximo ciclo", "p2", ("medio",)),
+    "P3": ("Backlog, sem urgência", "p3", ("baixo", "informativo")),
+}
+
+
+def render_plano_acao(achados: list) -> str:
+    """Índice de ação, não repetição do relatório: cada linha aponta para o
+    achado detalhado (mesma âncora #item-N) em vez de duplicar o texto.
+    Só entra achado acionável — "Verificado e OK" já não chega aqui, filtrado
+    antes da chamada."""
+    baldes = {k: [] for k in PLANO_BALDES}
+    for a in achados:
+        sev = a.get("severidade", "informativo")
+        for chave, (_rot, _cls, sevs) in PLANO_BALDES.items():
+            if sev in sevs:
+                baldes[chave].append(a)
+                break
+    if not any(baldes.values()):
+        return ""
+    grupos = []
+    for chave, (rotulo, cls, _sevs) in PLANO_BALDES.items():
+        itens = baldes[chave]
+        if not itens:
+            continue
+        linhas = "".join(
+            f'<li><a href="#item-{a.get("numero", esc(a["fingerprint"]))}">'
+            f'#{a.get("numero", 0):02d} {esc(a["titulo"])}</a> '
+            f'<span class="plano-cat">{esc(a["categoria"])} · {esc(cat_nome(a["categoria"]))}</span></li>'
+            for a in itens)
+        grupos.append(f"""<div class="plano-grupo">
+<h3><span class="plano-selo {cls}">{chave}</span> {esc(rotulo)} <span class="plano-n">({len(itens)})</span></h3>
+<ul>{linhas}</ul></div>""")
+    return f'<div class="plano"><h2>Plano de ação priorizado</h2>{"".join(grupos)}</div>'
+
+
 def render_html(ctx: dict) -> str:
     achados = ctx["achados"]
     suprimidos = ctx["suprimidos"]
@@ -2356,7 +2456,7 @@ def render_html(ctx: dict) -> str:
     for c in cats_presentes:
         itens = [a for a in achados if a["categoria"] == c]
         tabs.append(f'<div class="tab" data-alvo="p-{c}">{c} · {esc(cat_nome(c))} ({len(itens)})</div>')
-        paineis.append(f'<div class="painel" id="p-{c}">'
+        paineis.append(f'<div class="painel painel-cat" id="p-{c}">'
                        + "".join(render_item(a, mostrar_estado) for a in itens) + "</div>")
 
     # UMA legenda, fechada. As duas tabelas grandes que ficavam abertas acima
@@ -2568,6 +2668,7 @@ Gravado fora do repositório auditado, com permissão 600; nenhum byte foi escri
 <div class="placar">{placar}</div>
 {linhas_diff}
 {legenda}
+{render_plano_acao(achados)}
 <div class="tabs">{''.join(tabs)}</div>
 {''.join(paineis)}
 <div class="rodape">
@@ -2830,13 +2931,20 @@ def cmd_render(args):
          "positivos": [a["fingerprint"] for a in dados["achados"] if e_positivo(a)]},
         ensure_ascii=False, indent=2))
     saida_exit = decidir_exit(dados)
-    print(json.dumps({"html": str(destino), "achados": len(dados["achados"]),
-                      "estado_dir": str(estado["dir"]),
-                      "categorias": {c: {k: v for k, v in d.items()
-                                         if k in ("resultado", "cobertura", "limpo")}
-                                     for c, d in categorias.items()},
-                      "escrita_no_alvo": "nenhuma",
-                      "exit_code": saida_exit}, ensure_ascii=False, indent=2))
+    resultado = {"html": str(destino), "achados": len(dados["achados"]),
+                 "estado_dir": str(estado["dir"]),
+                 "categorias": {c: {k: v for k, v in d.items()
+                                    if k in ("resultado", "cobertura", "limpo")}
+                                for c, d in categorias.items()},
+                 "escrita_no_alvo": "nenhuma",
+                 "exit_code": saida_exit}
+    if getattr(args, "pdf", False):
+        pdf = gerar_pdf(destino)
+        resultado["pdf"] = pdf
+        if not pdf["gerado"]:
+            print(f"ll-sec: aviso — PDF não gerado ({pdf['motivo']}); "
+                  "o HTML segue disponível", file=sys.stderr)
+    print(json.dumps(resultado, ensure_ascii=False, indent=2))
     return 0 if getattr(args, "exit_zero", False) else saida_exit
 
 
@@ -2867,6 +2975,10 @@ def main():
     p.add_argument("--repo-id", dest="repo_id", default=None, help=ajuda_id)
     p.add_argument("--findings", required=True)
     p.add_argument("--uso", default=None, help="JSON do session_usage.py")
+    p.add_argument("--pdf", action="store_true",
+                   help="além do HTML, exporta o mesmo relatório em PDF (mesmo nome, "
+                        "ao lado do HTML) via Chrome headless — precisa dele instalado "
+                        "nesta máquina; falha aqui não derruba o HTML")
     p.add_argument("--exit-zero", dest="exit_zero", action="store_true",
                    help="sempre sair com 0, mesmo com achado bloqueante ou cobertura parcial")
     p.set_defaults(f=cmd_render)

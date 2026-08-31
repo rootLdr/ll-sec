@@ -64,6 +64,24 @@ Cada achado sai com três campos que costumam faltar num scanner:
 Segredo aparece mascarado por padrão (`sk_liv********abcd`). Sai em texto claro
 apenas a regra que declara que o trecho é código, e não segredo.
 
+Logo abaixo da legenda, antes das abas, vem o **plano de ação priorizado**: os
+achados que pedem ação (tudo que não é "Verificado e OK") agrupados em três
+baldes por severidade — **P1** crítico/alto ("resolva antes de qualquer
+deploy"), **P2** médio ("resolva no próximo ciclo") e **P3** baixo/informativo
+("backlog, sem urgência"). Cada linha só tem o número e o título, e linka para
+o achado detalhado mais abaixo — é índice de ação, não um segundo relatório.
+
+## PDF
+
+`render --pdf` grava, ao lado do HTML, o mesmo relatório em PDF (mesmo nome,
+extensão trocada). É o próprio HTML impresso pelo Chrome headless já
+instalado na máquina (`--print-to-pdf`) — sem lib Python nova e sem duas
+implementações do mesmo relatório divergindo com o tempo. Formato A4, margem
+de 2 cm, abas todas expandidas na impressão (sem painel de categoria
+duplicado — só "Todos" e as abas sem equivalente nele). Se o Chrome headless
+falhar, o HTML sai igual e o motivo aparece em `stderr` e no JSON de saída
+(`"pdf": {"gerado": false, "motivo": "..."}`) — nunca falha em silêncio.
+
 ## O que ela procura
 
 | | Categoria | Exemplo |

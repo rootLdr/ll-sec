@@ -243,13 +243,16 @@ scanner não sabe ler.
 ```bash
 python3 ~/.claude/skills/ll-sec/scripts/session_usage.py --projeto . > /tmp/ll-sec-uso.json
 python3 ~/.claude/skills/ll-sec/scripts/ll_sec_scan.py render --root . \
-  --findings <caminho do findings.json> --uso /tmp/ll-sec-uso.json
+  --findings <caminho do findings.json> --uso /tmp/ll-sec-uso.json --pdf
 ```
 
 O HTML sai em `~/.local/state/ll-sec/<repo-id>/relatorios/ll-sec-<projeto>-<modo>-AAAA-MM-DD-HHMM.html`
 (modo = `completo`, `rapido` ou `diff`) — **fora do repositório auditado**, com
 permissão `600`. O comando imprime o caminho absoluto; **passe esse caminho ao
 operador**. Arquivo único, offline, tema escuro, imprimível.
+
+Com `--pdf` (opcional, opt-in — depende do Chrome headless estar instalado
+nesta máquina), sai também o `.pdf` de mesmo nome, ao lado do HTML — ver 5.4.
 
 A página abre com **o total de vulnerabilidades abertas**, os cinco cartões de
 nota que somam esse total, as linhas curtas de contexto (quebra temporal,
@@ -330,6 +333,47 @@ o que você verificou e estava são como achado com `"tipo": "positivo"`
 do placar **e também dos números da quebra temporal** — positivo não é "novo"
 nem "conhecido", é o oposto de vulnerabilidade — e os agrupa na aba
 **"✓ Verificado e OK"**, para não misturar com o que pede ação.
+
+### 5.3 Plano de ação priorizado
+
+Logo abaixo da legenda, antes das abas, o relatório traz um índice curto —
+**Plano de ação priorizado** — que agrupa os achados acionáveis (tudo que não é
+`"tipo": "positivo"`) em três baldes pela severidade, sem repetir o texto do
+achado:
+
+- **P1** (crítico/alto) — *"Resolva antes de qualquer deploy"*
+- **P2** (médio) — *"Resolva no próximo ciclo"*
+- **P3** (baixo/informativo) — *"Backlog, sem urgência"*
+
+Cada linha é só o número (`#03`), o título e a categoria, linkando para a
+âncora do achado detalhado (`#item-N`) mais abaixo na mesma página. É índice,
+não segundo relatório: quem quiser o texto completo clica e desce até o item.
+Balde sem item some da lista — não aparece "P1 (0)" vazio.
+
+### 5.4 Exportação em PDF
+
+`render` aceita `--pdf`: além do HTML, imprime o mesmo documento em PDF, ao
+lado dele, trocando só a extensão (`ll-sec-<projeto>-<modo>-....html` →
+`....pdf`). Não é uma segunda implementação do relatório — é o **mesmo HTML**
+impresso pelo Chrome headless já instalado nesta máquina
+(`~/.agent-browser/browsers/chrome-152.0.7977.42/chrome`, via
+`--print-to-pdf`), então os dois nunca divergem e nenhuma lib Python nova
+entrou (nada de `reportlab`/`weasyprint`/`matplotlib`).
+
+O CSS de impressão (`@media print`) já cuidava de expandir todas as abas; a
+exportação em PDF só corrigiu o que sobrava: sem ajuste, cada painel de
+categoria repetia os mesmos itens que já aparecem na aba "Todos", e o PDF
+saía com o relatório inteiro duplicado uma vez por categoria — o CSS agora
+esconde os painéis `painel-cat` na impressão e mantém só "Todos" (mais
+Cobertura, "✓ Verificado e OK", "Riscos aceitos" e "Pendências", que não têm
+duplicata). Página A4, margem de 2 cm, e cada achado (`.item`) segue com
+`break-inside: avoid` para não cortar no meio entre páginas.
+
+Falha do Chrome headless (binário ausente, timeout, saída sem assinatura
+`%PDF-`) **não derruba a geração do HTML** — o HTML é o fallback e continua
+saindo sempre; o script imprime o motivo em `stderr` e devolve
+`"pdf": {"gerado": false, "motivo": "..."}` no JSON de saída em vez de falhar
+em silêncio.
 
 Vale a pena registrar como positivo aquilo que, se regredir, você quer que
 apareça: guardas de autorização presentes, histórico de Git sem segredo,
